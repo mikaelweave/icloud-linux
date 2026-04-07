@@ -41,6 +41,13 @@ class DriverStateTests(unittest.TestCase):
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
 
+    def test_ensure_dir_replaces_file_placeholder(self):
+        self.mirror.create_file("/Obsidian")
+
+        self.mirror.ensure_dir("/Obsidian")
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
+
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
             {
@@ -168,6 +175,29 @@ class DriverStateTests(unittest.TestCase):
 
         entry = self.state.get_entry("/docs/a.txt")
         self.assertEqual(entry["hydrated"], 0)
+
+    def test_reconcile_persistent_cache_replaces_app_library_placeholder(self):
+        self.state.upsert_entry(
+            {
+                "path": "/Obsidian",
+                "type": "app_library",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Obsidian",
+            }
+        )
+        self.mirror.create_file("/Obsidian")
+
+        api = Mock()
+        api.drive.root = Mock()
+        engine = ICloudSyncEngine(api, self.mirror, self.state, Mock())
+
+        engine._reconcile_persistent_cache()
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
 
     def test_remote_shareid_round_trips_through_state(self):
         self.state.upsert_entry(
@@ -306,11 +336,35 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.engine._schedule_download_with_delay.assert_called_once()
 
+    def test_object_not_found_download_is_suppressed_until_refresh(self):
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudAPIResponseException(
+                "ObjectNotFoundException: Could not find document",
+                404,
+            )
+        )
+        self.engine._schedule_download_with_delay = Mock()
+        self.engine.scheduled_downloads.add("/docs/a.txt")
+
+        self.engine._download_job("/docs/a.txt")
+
+        self.engine._schedule_download_with_delay.assert_not_called()
+        self.assertIn("/docs/a.txt", self.engine.suppressed_hydration_paths)
+
     def test_schedule_download_ignores_executor_shutdown_race(self):
         self.engine.executor.submit = Mock(side_effect=RuntimeError("cannot schedule new futures after interpreter shutdown"))
 
         self.engine._schedule_download_with_delay("/docs/a.txt", 0)
 
+        self.assertNotIn("/docs/a.txt", self.engine.scheduled_downloads)
+
+    def test_schedule_download_skips_suppressed_path(self):
+        self.engine.suppressed_hydration_paths.add("/docs/a.txt")
+        self.engine.executor.submit = Mock()
+
+        self.engine._schedule_download_with_delay("/docs/a.txt", 0)
+
+        self.engine.executor.submit.assert_not_called()
         self.assertNotIn("/docs/a.txt", self.engine.scheduled_downloads)
 
     def test_node_from_entry_reuses_persisted_file_metadata(self):
@@ -408,6 +462,100 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+    def test_crawl_descends_into_app_library_nodes(self):
+        note = Mock()
+        note.name = "vault.md"
+        note.data = {
+            "type": "FILE",
+            "drivewsid": "file-1",
+            "docwsid": "doc-1",
+            "etag": "etag-1",
+            "zone": "zone-1",
+            "size": 12,
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        obsidian = Mock()
+        obsidian.name = "Obsidian"
+        obsidian.data = {
+            "type": "APP_LIBRARY",
+            "drivewsid": "folder-1",
+            "docwsid": "documents",
+            "etag": "etag-folder",
+            "zone": "zone-1",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        obsidian.get_children.return_value = [note]
+        root = Mock()
+        root.get_children.return_value = [obsidian]
+        self.engine.api.drive.root = root
+
+        snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertIn("folder-1", snapshot)
+        self.assertIn("file-1", snapshot)
+        self.assertEqual(snapshot["folder-1"]["path"], "/Obsidian")
+        self.assertEqual(snapshot["folder-1"]["type"], "app_library")
+        self.assertEqual(snapshot["file-1"]["path"], "/Obsidian/vault.md")
+
+    def test_materialize_remote_entry_treats_app_library_as_directory(self):
+        self.engine._materialize_remote_entry(
+            {
+                "path": "/Obsidian",
+                "type": "app_library",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "remote_docwsid": "documents",
+                "remote_etag": "etag-folder",
+                "remote_zone": "zone-1",
+                "size": 0,
+                "mtime": 123,
+            }
+        )
+
+        self.assertTrue(self.mirror.is_dir("/Obsidian"))
+        entry = self.state.get_entry("/Obsidian")
+        self.assertEqual(entry["hydrated"], 1)
+
+    def test_apply_remote_snapshot_clears_suppression_and_reschedules_file(self):
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "size": 12,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+        self.engine.suppressed_hydration_paths.add("/docs/a.txt")
+        self.engine._schedule_download = Mock()
+
+        self.engine._apply_remote_snapshot(
+            {
+                "file-1": {
+                    "path": "/docs/a.txt",
+                    "type": "file",
+                    "parent_path": "/docs",
+                    "remote_drivewsid": "file-1",
+                    "remote_docwsid": "doc-1",
+                    "remote_etag": "etag-1",
+                    "remote_zone": "zone-1",
+                    "size": 12,
+                    "mtime": 123,
+                }
+            }
+        )
+
+        self.assertNotIn("/docs/a.txt", self.engine.suppressed_hydration_paths)
+        self.engine._schedule_download.assert_called_once_with("/docs/a.txt")
 
 
 if __name__ == "__main__":
