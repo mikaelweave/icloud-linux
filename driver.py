@@ -688,6 +688,7 @@ class ICloudSyncEngine:
         self.downloads_lock = threading.Lock()
         self.download_retry_attempts = {}
         self.download_retry_timers = {}
+        self.suppressed_hydration_paths = set()
         self.threads = []
         self.hydration_total = 0
         self.hydration_completed = 0
@@ -808,6 +809,30 @@ class ICloudSyncEngine:
             missing_files,
         )
 
+    def _is_not_found_error(self, exc):
+        status_code = getattr(exc, "code", None)
+        if status_code == 404:
+            return True
+        message = str(exc).lower()
+        return (
+            "wsobjectnotfound" in message
+            or "objectnotfoundexception" in message
+            or "could not find document" in message
+            or "not found (404)" in message
+        )
+
+    def _suppress_hydration_until_refresh(self, path):
+        with self.downloads_lock:
+            self.download_retry_attempts.pop(path, None)
+            timer = self.download_retry_timers.pop(path, None)
+            self.suppressed_hydration_paths.add(path)
+        if timer is not None:
+            timer.cancel()
+
+    def _clear_hydration_suppressions(self):
+        with self.downloads_lock:
+            self.suppressed_hydration_paths.clear()
+
     def ensure_local_file(self, path):
         entry = self.state.get_entry(path)
         if not entry or entry["type"] != "file" or entry["tombstone"]:
@@ -908,6 +933,7 @@ class ICloudSyncEngine:
         return snapshot
 
     def _apply_remote_snapshot(self, snapshot):
+        self._clear_hydration_suppressions()
         remote_ids = set(snapshot.keys())
 
         for meta in snapshot.values():
@@ -1039,7 +1065,11 @@ class ICloudSyncEngine:
             self.state.queue_op("conflict-copy", child["path"])
 
     def _schedule_all_unhydrated(self):
-        paths = self.state.list_unhydrated_paths()
+        paths = [
+            path
+            for path in self.state.list_unhydrated_paths()
+            if path not in self.suppressed_hydration_paths
+        ]
         total = len(paths)
         with self.hydration_progress_lock:
             self.hydration_total = total
@@ -1059,6 +1089,8 @@ class ICloudSyncEngine:
             return
 
         with self.downloads_lock:
+            if path in self.suppressed_hydration_paths:
+                return
             if path in self.scheduled_downloads:
                 return
             self.scheduled_downloads.add(path)
@@ -1140,6 +1172,14 @@ class ICloudSyncEngine:
                 )
                 with self.downloads_lock:
                     self.download_retry_attempts.pop(path, None)
+                return
+            if self._is_not_found_error(exc):
+                self._suppress_hydration_until_refresh(path)
+                self.logger.warning(
+                    "Warmup download skipped until next refresh for %s: %s",
+                    path,
+                    exc,
+                )
                 return
             with self.downloads_lock:
                 attempt = self.download_retry_attempts.get(path, 0) + 1

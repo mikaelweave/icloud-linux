@@ -291,11 +291,35 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.engine._schedule_download_with_delay.assert_called_once()
 
+    def test_object_not_found_download_is_suppressed_until_refresh(self):
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudAPIResponseException(
+                "ObjectNotFoundException: Could not find document",
+                404,
+            )
+        )
+        self.engine._schedule_download_with_delay = Mock()
+        self.engine.scheduled_downloads.add("/docs/a.txt")
+
+        self.engine._download_job("/docs/a.txt")
+
+        self.engine._schedule_download_with_delay.assert_not_called()
+        self.assertIn("/docs/a.txt", self.engine.suppressed_hydration_paths)
+
     def test_schedule_download_ignores_executor_shutdown_race(self):
         self.engine.executor.submit = Mock(side_effect=RuntimeError("cannot schedule new futures after interpreter shutdown"))
 
         self.engine._schedule_download_with_delay("/docs/a.txt", 0)
 
+        self.assertNotIn("/docs/a.txt", self.engine.scheduled_downloads)
+
+    def test_schedule_download_skips_suppressed_path(self):
+        self.engine.suppressed_hydration_paths.add("/docs/a.txt")
+        self.engine.executor.submit = Mock()
+
+        self.engine._schedule_download_with_delay("/docs/a.txt", 0)
+
+        self.engine.executor.submit.assert_not_called()
         self.assertNotIn("/docs/a.txt", self.engine.scheduled_downloads)
 
     def test_node_from_entry_reuses_persisted_file_metadata(self):
@@ -317,6 +341,46 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(node.data["docwsid"], "doc-1")
         self.assertEqual(node.data["shareID"], shareid)
         self.assertEqual(node.data["size"], 5)
+
+    def test_apply_remote_snapshot_clears_suppression_and_reschedules_file(self):
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "size": 12,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+        self.engine.suppressed_hydration_paths.add("/docs/a.txt")
+        self.engine._schedule_download = Mock()
+
+        self.engine._apply_remote_snapshot(
+            {
+                "file-1": {
+                    "path": "/docs/a.txt",
+                    "type": "file",
+                    "parent_path": "/docs",
+                    "remote_drivewsid": "file-1",
+                    "remote_docwsid": "doc-1",
+                    "remote_etag": "etag-1",
+                    "remote_zone": "zone-1",
+                    "size": 12,
+                    "mtime": 123,
+                }
+            }
+        )
+
+        self.assertNotIn("/docs/a.txt", self.engine.suppressed_hydration_paths)
+        self.engine._schedule_download.assert_called_once_with("/docs/a.txt")
 
 
 if __name__ == "__main__":
