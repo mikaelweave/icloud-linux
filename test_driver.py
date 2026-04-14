@@ -1,12 +1,16 @@
+import contextlib
 import io
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import unittest
 from unittest.mock import Mock
 
-from driver import ICloudSyncEngine, LocalMirror, SyncState
+import fuse
+
+from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState, resolve_permissions_config
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -15,6 +19,15 @@ class NoUnboundedReadStream(io.BytesIO):
         if size is None or size < 0:
             raise AssertionError("stream was read without a chunk size")
         return super().read(size)
+
+
+@contextlib.contextmanager
+def temporary_umask(mask):
+    previous = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 class DriverStateTests(unittest.TestCase):
@@ -47,6 +60,42 @@ class DriverStateTests(unittest.TestCase):
         self.mirror.ensure_dir("/Obsidian")
 
         self.assertTrue(self.mirror.is_dir("/Obsidian"))
+
+    def test_mirror_normalizes_created_file_and_directory_modes(self):
+        with temporary_umask(0o077):
+            self.mirror.create_file("/Obsidian/vault.md")
+            self.mirror.write("/Obsidian/vault.md", b"hello", 0)
+
+        note_mode = stat.S_IMODE(self.mirror.stat_local("/Obsidian/vault.md").st_mode)
+        dir_mode = stat.S_IMODE(self.mirror.stat_local("/Obsidian").st_mode)
+
+        self.assertEqual(note_mode, 0o644)
+        self.assertEqual(dir_mode, 0o755)
+
+    def test_mirror_normalizes_placeholder_and_streamed_download_modes(self):
+        with temporary_umask(0o077):
+            self.mirror.materialize_placeholder("/docs/a.txt", 16, 123)
+            self.mirror.write_atomic_stream("/docs/b.txt", io.BytesIO(b"streamed content"))
+
+        placeholder_mode = stat.S_IMODE(self.mirror.stat_local("/docs/a.txt").st_mode)
+        streamed_mode = stat.S_IMODE(self.mirror.stat_local("/docs/b.txt").st_mode)
+        dir_mode = stat.S_IMODE(self.mirror.stat_local("/docs").st_mode)
+
+        self.assertEqual(placeholder_mode, 0o644)
+        self.assertEqual(streamed_mode, 0o644)
+        self.assertEqual(dir_mode, 0o755)
+
+    def test_mirror_uses_custom_modes_for_shared_write_layouts(self):
+        shared_mirror = LocalMirror(self.root, file_mode=0o666, dir_mode=0o777)
+
+        with temporary_umask(0o077):
+            shared_mirror.create_file("/docs/a.txt")
+
+        note_mode = stat.S_IMODE(shared_mirror.stat_local("/docs/a.txt").st_mode)
+        dir_mode = stat.S_IMODE(shared_mirror.stat_local("/docs").st_mode)
+
+        self.assertEqual(note_mode, 0o666)
+        self.assertEqual(dir_mode, 0o777)
 
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(
@@ -261,6 +310,10 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
         self.logger = Mock()
         api = Mock()
+        api.drive.service_root = "https://example.invalid/drivews"
+        api.drive.params = {"clientId": "test-client"}
+        api.drive.session = Mock()
+        api.drive._raise_if_error = Mock()
         api.drive.root = Mock()
         self.engine = ICloudSyncEngine(api, self.mirror, self.state, self.logger)
         self.engine._start_background_threads = Mock()
@@ -298,6 +351,33 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._reconcile_persistent_cache.assert_not_called()
         self.engine._schedule_all_unhydrated.assert_called_once()
         self.engine._start_background_threads.assert_called_once()
+
+    def test_reconcile_persistent_cache_normalizes_existing_modes(self):
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "size": 5,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+        self.mirror.write("/docs/a.txt", b"hello", 0)
+        os.chmod(self.mirror.local_path("/docs"), 0o700)
+        os.chmod(self.mirror.local_path("/docs/a.txt"), 0o600)
+
+        self.engine._reconcile_persistent_cache = ICloudSyncEngine._reconcile_persistent_cache.__get__(self.engine)
+        self.engine._reconcile_persistent_cache()
+
+        note_mode = stat.S_IMODE(self.mirror.stat_local("/docs/a.txt").st_mode)
+        dir_mode = stat.S_IMODE(self.mirror.stat_local("/docs").st_mode)
+
+        self.assertEqual(note_mode, 0o644)
+        self.assertEqual(dir_mode, 0o755)
 
     def test_failed_download_is_retried_with_backoff(self):
         self.engine.ensure_local_file = Mock(side_effect=RuntimeError("500"))
@@ -387,6 +467,26 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(node.data["shareID"], shareid)
         self.assertEqual(node.data["size"], 5)
 
+    def test_node_to_meta_inherits_parent_shareid_for_shared_child(self):
+        shareid = {"share-zone": "abc"}
+        node = Mock()
+        node.data = {
+            "type": "FOLDER",
+            "drivewsid": "folder-1",
+            "docwsid": "documents",
+            "etag": "etag-folder",
+            "zone": "zone-1",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+
+        meta = self.engine._node_to_meta(
+            node,
+            "/Shared/child",
+            inherited_shareid=shareid,
+        )
+
+        self.assertEqual(meta["remote_shareid"], shareid)
+
     def test_ensure_local_file_streams_remote_content_in_chunks(self):
         self.state.upsert_entry(
             {
@@ -440,6 +540,7 @@ class SyncEngineStartupTests(unittest.TestCase):
             upload_state["prefix"] = stream.read(5)
 
         parent_node = Mock()
+        parent_node.data = {}
         parent_node.upload.side_effect = capture_upload
         self.engine._ensure_remote_parent = Mock(return_value=parent_node)
         self.engine.ensure_local_file = Mock()
@@ -462,6 +563,193 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+    def test_sync_file_uses_staged_upload_for_new_shared_file(self):
+        shareid = {"share-zone": "abc"}
+        self.mirror.create_file("/Shared/note.md")
+        self.mirror.write("/Shared/note.md", b"hello world", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/Shared",
+                "type": "folder",
+                "parent_path": "/",
+                "remote_drivewsid": "shared-root",
+                "remote_docwsid": "shared-doc",
+                "remote_shareid": shareid,
+                "remote_zone": "zone-1",
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Shared",
+            }
+        )
+        self.state.upsert_entry(
+            {
+                "path": "/Shared/note.md",
+                "type": "file",
+                "parent_path": "/Shared",
+                "remote_drivewsid": None,
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/Shared/note.md",
+            }
+        )
+        parent_node = Mock()
+        parent_node.data = {
+            "drivewsid": "shared-root",
+            "docwsid": "shared-doc",
+            "shareID": shareid,
+            "zone": "zone-1",
+        }
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine.ensure_local_file = Mock()
+        self.engine._upload_shared_file = Mock()
+        self.engine._reconcile_child_meta = Mock(
+            return_value={
+                "path": "/Shared/note.md",
+                "type": "file",
+                "parent_path": "/Shared",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "size": 11,
+                "mtime": 123,
+            }
+        )
+
+        self.engine._sync_file(self.state.get_entry("/Shared/note.md"))
+
+        self.engine._upload_shared_file.assert_called_once()
+        stream = self.engine._upload_shared_file.call_args[0][1]
+        self.assertEqual(stream.__class__.__name__, "NamedFileStream")
+        self.assertEqual(stream.name, "note.md")
+
+    def test_create_remote_directory_includes_shareid_for_shared_parent(self):
+        shareid = {"share-zone": "abc"}
+        parent_node = Mock()
+        parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
+        response = Mock()
+        response.json.return_value = {
+            "folders": [
+                {
+                    "drivewsid": "folder-1",
+                    "docwsid": "documents",
+                    "etag": "etag-1",
+                    "zone": "zone-1",
+                    "name": "child",
+                    "type": "FOLDER",
+                }
+            ]
+        }
+        self.engine.api.drive.session.post = Mock(return_value=response)
+        self.engine.api.drive._raise_if_error = Mock()
+
+        node = self.engine._create_remote_directory(parent_node, "child")
+
+        request_json = self.engine.api.drive.session.post.call_args.kwargs["json"]
+        self.assertEqual(request_json["shareID"], shareid)
+        self.assertEqual(request_json["destinationDrivewsId"], "shared-root")
+        self.assertEqual(node.data["drivewsid"], "folder-1")
+        self.assertEqual(node.data["shareID"], shareid)
+
+    def test_move_remote_nodes_includes_shareid_for_shared_destination(self):
+        shareid = {"share-zone": "abc"}
+        node = Mock()
+        node.data = {"drivewsid": "file-1", "etag": "etag-1"}
+        destination = Mock()
+        destination.data = {"drivewsid": "shared-root", "shareID": shareid}
+        response = Mock()
+        response.json.return_value = {"items": []}
+        self.engine.api.drive.session.post = Mock(return_value=response)
+        self.engine.api.drive._raise_if_error = Mock()
+
+        self.engine._move_remote_nodes([node], destination)
+
+        request_json = self.engine.api.drive.session.post.call_args.kwargs["json"]
+        self.assertEqual(request_json["shareID"], shareid)
+        self.assertEqual(request_json["destinationDrivewsId"], "shared-root")
+        self.assertEqual(request_json["items"][0]["drivewsid"], "file-1")
+
+    def test_upload_shared_file_stages_via_root_and_moves_into_shared_parent(self):
+        shareid = {"share-zone": "abc"}
+        parent_node = Mock()
+        parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
+        root_node = Mock()
+        staging_node = Mock()
+        staging_node.name = ".icloud-linux-stage-test"
+        staged_child = Mock()
+        staged_child.name = "note.md"
+        staged_child.data = {"drivewsid": "file-1", "etag": "etag-1"}
+        staging_node.get_children.side_effect = [[staged_child], []]
+        self.engine.api.drive.root = root_node
+        self.engine._create_remote_directory = Mock(return_value=staging_node)
+        self.engine._move_remote_nodes = Mock()
+        stream = io.BytesIO(b"hello")
+        stream.name = "note.md"
+
+        self.engine._upload_shared_file(parent_node, stream)
+
+        create_args = self.engine._create_remote_directory.call_args[0]
+        self.assertIs(create_args[0], root_node)
+        self.assertTrue(create_args[1].startswith(".icloud-linux-stage-"))
+        staging_node.upload.assert_called_once_with(stream)
+        self.engine._move_remote_nodes.assert_called_once_with([staged_child], parent_node)
+        staging_node.delete.assert_called_once()
+
+    def test_reconcile_child_meta_falls_back_to_remote_snapshot_for_shared_parent(self):
+        shareid = {"share-zone": "abc"}
+        self.state.upsert_entry(
+            {
+                "path": "/Shared",
+                "type": "folder",
+                "parent_path": "/",
+                "remote_drivewsid": "shared-root",
+                "remote_shareid": shareid,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Shared",
+            }
+        )
+        self.engine._refresh_child_meta = Mock(side_effect=KeyError("Missing child child under /Shared"))
+        self.engine._crawl_remote_snapshot = Mock(
+            return_value={
+                "folder-1": {
+                    "path": "/Shared/child",
+                    "type": "folder",
+                    "parent_path": "/Shared",
+                    "remote_drivewsid": "folder-1",
+                    "remote_docwsid": "documents",
+                    "remote_etag": "etag-folder",
+                    "remote_zone": "zone-1",
+                    "remote_shareid": shareid,
+                    "size": 0,
+                    "mtime": 123,
+                }
+            }
+        )
+
+        def apply_snapshot(snapshot):
+            self.state.upsert_entry(
+                {
+                    **snapshot["folder-1"],
+                    "hydrated": True,
+                    "dirty": False,
+                    "tombstone": False,
+                    "synced_path": "/Shared/child",
+                }
+            )
+
+        self.engine._apply_remote_snapshot = Mock(side_effect=apply_snapshot)
+
+        meta = self.engine._reconcile_child_meta("/Shared", "child")
+
+        self.assertEqual(meta["remote_drivewsid"], "folder-1")
+        self.assertEqual(meta["remote_shareid"], shareid)
+        self.engine._crawl_remote_snapshot.assert_called_once()
 
     def test_crawl_descends_into_app_library_nodes(self):
         note = Mock()
@@ -497,6 +785,52 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(snapshot["folder-1"]["path"], "/Obsidian")
         self.assertEqual(snapshot["folder-1"]["type"], "app_library")
         self.assertEqual(snapshot["file-1"]["path"], "/Obsidian/vault.md")
+
+    def test_crawl_remote_snapshot_propagates_shareid_to_descendants(self):
+        shareid = {"share-zone": "abc"}
+        note = Mock()
+        note.name = "note.md"
+        note.data = {
+            "type": "FILE",
+            "drivewsid": "file-1",
+            "docwsid": "doc-1",
+            "etag": "etag-1",
+            "zone": "zone-1",
+            "size": 12,
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        child_folder = Mock()
+        child_folder.name = "child"
+        child_folder.data = {
+            "type": "FOLDER",
+            "drivewsid": "folder-2",
+            "docwsid": "documents",
+            "etag": "etag-child",
+            "zone": "zone-1",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        child_folder.get_children.return_value = [note]
+        shared_root = Mock()
+        shared_root.name = "Shared"
+        shared_root.data = {
+            "type": "FOLDER",
+            "drivewsid": "shared-root",
+            "docwsid": "documents",
+            "etag": "etag-root",
+            "zone": "zone-1",
+            "shareID": shareid,
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        shared_root.get_children.return_value = [child_folder]
+        root = Mock()
+        root.data = {"drivewsid": "root"}
+        root.get_children.return_value = [shared_root]
+        self.engine.api.drive.root = root
+
+        snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertEqual(snapshot["folder-2"]["remote_shareid"], shareid)
+        self.assertEqual(snapshot["file-1"]["remote_shareid"], shareid)
 
     def test_materialize_remote_entry_treats_app_library_as_directory(self):
         self.engine._materialize_remote_entry(
@@ -556,6 +890,79 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.assertNotIn("/docs/a.txt", self.engine.suppressed_hydration_paths)
         self.engine._schedule_download.assert_called_once_with("/docs/a.txt")
+
+
+class FuseOptionTests(unittest.TestCase):
+    def test_apply_fuse_options_adds_enabled_options(self):
+        fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
+
+        fs.apply_fuse_options(
+            {
+                "allow_other": True,
+                "nonempty": True,
+                "ro": False,
+                "fsname": "icloud-linux",
+            }
+        )
+
+        self.assertIn("allow_other", fs.fuse_args.optlist)
+        self.assertIn("nonempty", fs.fuse_args.optlist)
+        self.assertNotIn("ro", fs.fuse_args.optlist)
+        self.assertEqual(fs.fuse_args.optdict["fsname"], "icloud-linux")
+
+    def test_apply_fuse_options_rejects_non_mapping(self):
+        fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
+
+        with self.assertRaises(ValueError):
+            fs.apply_fuse_options(["allow_other"])
+
+
+class PermissionConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_apply_permissions_config_controls_presented_attrs(self):
+        self.fs.apply_permissions_config(
+            {
+                "uid": 2001,
+                "gid": 3001,
+                "file_mode": "0666",
+                "dir_mode": "0777",
+            }
+        )
+        self.fs.mirror = LocalMirror(self.root, file_mode=self.fs.file_mode, dir_mode=self.fs.dir_mode)
+        self.fs.mirror.ensure_dir("/docs")
+        self.fs.mirror.create_file("/docs/a.txt")
+
+        dir_attrs = self.fs.getattr("/docs")
+        file_attrs = self.fs.getattr("/docs/a.txt")
+
+        self.assertEqual(stat.S_IMODE(dir_attrs.st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(file_attrs.st_mode), 0o666)
+        self.assertEqual(dir_attrs.st_uid, 2001)
+        self.assertEqual(dir_attrs.st_gid, 3001)
+        self.assertEqual(file_attrs.st_uid, 2001)
+        self.assertEqual(file_attrs.st_gid, 3001)
+
+    def test_resolve_permissions_config_uses_defaults(self):
+        resolved = resolve_permissions_config(None)
+
+        self.assertEqual(resolved["file_mode"], 0o644)
+        self.assertEqual(resolved["dir_mode"], 0o755)
+        self.assertEqual(resolved["uid"], os.getuid())
+        self.assertEqual(resolved["gid"], os.getgid())
+
+    def test_resolve_permissions_config_rejects_invalid_mode(self):
+        with self.assertRaises(ValueError):
+            resolve_permissions_config({"dir_mode": "not-a-mode"})
 
 
 if __name__ == "__main__":

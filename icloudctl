@@ -2,16 +2,82 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.config/icloud-linux"
-STATE_DIR="$HOME/.local/state/icloud-linux"
-CACHE_DIR="$HOME/.cache/icloud-linux"
-SERVICE_DIR="$HOME/.config/systemd/user"
-CONFIG_FILE="$CONFIG_DIR/config.yaml"
-ENV_FILE="$CONFIG_DIR/icloud.env"
-SERVICE_FILE="$SERVICE_DIR/icloud.service"
-MOUNT_DIR_DEFAULT="$HOME/iCloud"
+SERVICE_NAME="icloud.service"
+SERVICE_SCOPE="user"
+SYSTEMD_WANTED_BY="default.target"
+SYSTEMCTL_CMD=(systemctl --user)
+
+expand_home_path() {
+  local path="$1"
+  case "$path" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${path#"~/"}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+set_scope() {
+  local scope="${1:-user}"
+  case "$scope" in
+    user)
+      SERVICE_SCOPE="user"
+      SYSTEMD_WANTED_BY="default.target"
+      SYSTEMCTL_CMD=(systemctl --user)
+      CONFIG_DIR="${ICLOUD_CONFIG_DIR:-$HOME/.config/icloud-linux}"
+      STATE_DIR="${ICLOUD_STATE_DIR:-$HOME/.local/state/icloud-linux}"
+      CACHE_DIR="${ICLOUD_CACHE_DIR:-$HOME/.cache/icloud-linux}"
+      SERVICE_DIR="${ICLOUD_SERVICE_DIR:-$HOME/.config/systemd/user}"
+      MOUNT_DIR_DEFAULT="${ICLOUD_MOUNT_DEFAULT:-$HOME/iCloud}"
+      ;;
+    system)
+      SERVICE_SCOPE="system"
+      SYSTEMD_WANTED_BY="multi-user.target"
+      SYSTEMCTL_CMD=(systemctl)
+      CONFIG_DIR="${ICLOUD_CONFIG_DIR:-/root/.config/icloud-linux}"
+      STATE_DIR="${ICLOUD_STATE_DIR:-/root/.local/state/icloud-linux}"
+      CACHE_DIR="${ICLOUD_CACHE_DIR:-/root/.cache/icloud-linux}"
+      SERVICE_DIR="${ICLOUD_SERVICE_DIR:-/etc/systemd/system}"
+      MOUNT_DIR_DEFAULT="${ICLOUD_MOUNT_DEFAULT:-/root/iCloud}"
+      ;;
+    *)
+      echo "Unknown service scope: $scope" >&2
+      exit 1
+      ;;
+  esac
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  ENV_FILE="$CONFIG_DIR/icloud.env"
+  SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME"
+}
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1"; exit 1; }; }
+
+ensure_system_scope_allowed() {
+  if [[ "$SERVICE_SCOPE" == "system" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "System-scope commands must run as root."
+    exit 1
+  fi
+}
+
+systemctl_run() {
+  "${SYSTEMCTL_CMD[@]}" "$@"
+}
+
+read_config_scalar() {
+  local key="$1"
+  local default="${2:-}"
+  local value=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    value="$(sed -n "s/^${key}:[[:space:]]*//p" "$CONFIG_FILE" | head -1)"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+  fi
+  if [[ -z "$value" ]]; then
+    value="$default"
+  fi
+  expand_home_path "$value"
+}
 
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$SERVICE_DIR"
@@ -37,7 +103,7 @@ write_service() {
   local mount_dir="$1"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=iCloud Linux FUSE filesystem (user)
+Description=iCloud Linux FUSE filesystem ($SERVICE_SCOPE)
 After=network-online.target
 Wants=network-online.target
 
@@ -51,10 +117,11 @@ RestartSec=15
 TimeoutStopSec=10
 KillMode=control-group
 ExecStopPost=-/usr/bin/fusermount -uz $mount_dir
-Environment=ICLOUD_LOG_PATH=%h/.local/state/icloud-linux/icloud.log
+WorkingDirectory=$REPO_DIR
+Environment=ICLOUD_LOG_PATH=$STATE_DIR/icloud.log
 
 [Install]
-WantedBy=default.target
+WantedBy=$SYSTEMD_WANTED_BY
 EOF
 }
 
@@ -96,6 +163,7 @@ cleanup_mountpoint() {
 cmd_init() {
   local mount_dir="${1:-$MOUNT_DIR_DEFAULT}"
   need_cmd systemctl
+  ensure_system_scope_allowed
   ensure_dirs
   ensure_venv
   create_config_if_missing
@@ -117,8 +185,8 @@ cmd_init() {
 
   write_env "$mount_dir"
   write_service "$mount_dir"
-  systemctl --user daemon-reload
-  systemctl --user enable icloud.service >/dev/null
+  systemctl_run daemon-reload
+  systemctl_run enable "$SERVICE_NAME" >/dev/null
   echo "Initialized."
   echo "- Config: $CONFIG_FILE"
   echo "- Env:    $ENV_FILE"
@@ -145,6 +213,11 @@ upload_interval_seconds: 30
 remote_refresh_interval_seconds: 300
 warmup_workers: 1
 cookie_dir: "$CONFIG_DIR/cookies"
+permissions:
+  file_mode: "0644"
+  dir_mode: "0755"
+  # uid: 1000
+  # gid: 1000
 fuse_options:
   allow_other: false
   ro: false
@@ -160,22 +233,82 @@ cmd_auth() {
   "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE"
 }
 
-cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
-cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user --no-pager status icloud.service || true; }
-cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
-cmd_status() { systemctl --user --no-pager status icloud.service; }
-cmd_logs() { journalctl --user -u icloud.service -f; }
+cmd_auth_status() {
+  local cookie_dir
+  local username
+  local newest_mtime
+  local now
+  local age_days
+  local days_left
+  local status
+
+  username="$(read_config_scalar "username" "")"
+  cookie_dir="$(read_config_scalar "cookie_dir" "$CONFIG_DIR/cookies")"
+
+  echo "== icloud-linux auth status =="
+  echo "Config: $CONFIG_FILE"
+  if [[ -n "$username" ]]; then
+    echo "Apple ID: $username"
+  fi
+  echo "Cookie dir: $cookie_dir"
+
+  if [[ ! -d "$cookie_dir" ]] || [[ -z "$(ls -A "$cookie_dir" 2>/dev/null)" ]]; then
+    echo "Status: not authenticated"
+    echo "Session age: unknown"
+    echo "Days left: unknown"
+    echo "Next: ./icloudctl auth"
+    return 1
+  fi
+
+  newest_mtime="$(find "$cookie_dir" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+  if [[ -z "$newest_mtime" ]]; then
+    echo "Status: not authenticated"
+    echo "Session age: unknown"
+    echo "Days left: unknown"
+    echo "Next: ./icloudctl auth"
+    return 1
+  fi
+
+  now="$(date +%s)"
+  age_days=$(( (now - newest_mtime) / 86400 ))
+  days_left=$(( 60 - age_days ))
+
+  if [[ "$days_left" -le 0 ]]; then
+    status="expired"
+  elif [[ "$days_left" -le 10 ]]; then
+    status="reauthenticate soon"
+  else
+    status="authenticated"
+  fi
+
+  echo "Status: $status"
+  echo "Session age: ${age_days} day(s)"
+  echo "Days left: ~${days_left} day(s)"
+}
+
+cmd_start() { ensure_system_scope_allowed; cleanup_mountpoint "${1:-}"; systemctl_run start "$SERVICE_NAME"; systemctl_run --no-pager status "$SERVICE_NAME"; }
+cmd_stop() { ensure_system_scope_allowed; systemctl_run stop "$SERVICE_NAME" >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl_run --no-pager status "$SERVICE_NAME" || true; }
+cmd_restart() { ensure_system_scope_allowed; systemctl_run stop "$SERVICE_NAME" >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl_run start "$SERVICE_NAME"; systemctl_run --no-pager status "$SERVICE_NAME"; }
+cmd_status() { ensure_system_scope_allowed; systemctl_run --no-pager status "$SERVICE_NAME"; }
+cmd_logs() {
+  if [[ "$SERVICE_SCOPE" == "system" ]]; then
+    journalctl -u "$SERVICE_NAME" -f
+  else
+    journalctl --user -u "$SERVICE_NAME" -f
+  fi
+}
 cmd_clear_cache() {
   local was_active=0
-  systemctl --user is-active --quiet icloud.service && was_active=1 || true
-  systemctl --user stop icloud.service >/dev/null 2>&1 || true
+  ensure_system_scope_allowed
+  systemctl_run is-active --quiet "$SERVICE_NAME" && was_active=1 || true
+  systemctl_run stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   rm -rf "$CACHE_DIR"
   mkdir -p "$CACHE_DIR"
   echo "Cleared persistent cache under $CACHE_DIR"
   if [[ "$was_active" -eq 1 ]]; then
     echo "Restarting service to rebuild cache..."
-    systemctl --user start icloud.service
-    systemctl --user --no-pager status icloud.service
+    systemctl_run start "$SERVICE_NAME"
+    systemctl_run --no-pager status "$SERVICE_NAME"
   else
     echo "Service is stopped. Start it with './icloudctl start' to rebuild cache."
   fi
@@ -183,11 +316,12 @@ cmd_clear_cache() {
 
 cmd_uninstall() {
   local purge="${1:-}"
-  systemctl --user stop icloud.service >/dev/null 2>&1 || true
-  systemctl --user disable icloud.service >/dev/null 2>&1 || true
+  ensure_system_scope_allowed
+  systemctl_run stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl_run disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   rm -f "$SERVICE_FILE"
-  systemctl --user daemon-reload
-  systemctl --user reset-failed >/dev/null 2>&1 || true
+  systemctl_run daemon-reload
+  systemctl_run reset-failed >/dev/null 2>&1 || true
 
   if [[ "$purge" == "--purge" ]]; then
     rm -f "$CONFIG_FILE" "$ENV_FILE"
@@ -216,7 +350,7 @@ cmd_doctor() {
   else
     echo "MISSING: $ENV_FILE"
   fi
-  systemctl --user --no-pager status icloud.service >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
+  systemctl_run --no-pager status "$SERVICE_NAME" >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
 }
 
 cmd_quickstart() {
@@ -233,6 +367,16 @@ cmd_quickstart() {
   cmd_start
 }
 
+cmd_init_system() { set_scope system; cmd_init "$@"; }
+cmd_start_system() { set_scope system; cmd_start "$@"; }
+cmd_stop_system() { set_scope system; cmd_stop "$@"; }
+cmd_restart_system() { set_scope system; cmd_restart "$@"; }
+cmd_status_system() { set_scope system; cmd_status; }
+cmd_logs_system() { set_scope system; cmd_logs; }
+cmd_doctor_system() { set_scope system; cmd_doctor; }
+cmd_clear_cache_system() { set_scope system; cmd_clear_cache; }
+cmd_uninstall_system() { set_scope system; cmd_uninstall "$@"; }
+
 usage() {
   cat <<EOF
 Usage: ./icloudctl <command> [args]
@@ -240,13 +384,23 @@ Usage: ./icloudctl <command> [args]
 Commands:
   quickstart [mount_dir]   One-command guided setup
   init [mount_dir]         Initialize venv/config/service files
+  init-system [mount_dir]  Initialize venv/config/system service files
   configure [email]        Write config.yaml with credentials
   auth                     Run interactive 2FA bootstrap
+  auth-status              Show session age and approximate days left
   clear-cache              Remove local mirror/state and rebuild on next start
   start|stop|restart       Service control
   status                   Show service status
   logs                     Tail service logs
   doctor                   Check local setup health
+  start-system|stop-system|restart-system
+                           System service control for container/root installs
+  status-system            Show system service status
+  logs-system              Tail system service logs
+  doctor-system            Check system-scope setup health
+  clear-cache-system       Clear cache for a system-scope install
+  uninstall-system [--purge]
+                           Remove system service (optionally remove local data)
   uninstall [--purge]      Remove service (optionally remove local data)
 EOF
 }
@@ -254,19 +408,30 @@ EOF
 main() {
   local cmd="${1:-}"
   shift || true
+  set_scope user
   case "$cmd" in
     quickstart) cmd_quickstart "$@" ;;
     init) cmd_init "$@" ;;
+    init-system) cmd_init_system "$@" ;;
     configure) cmd_configure "$@" ;;
     auth) cmd_auth ;;
+    auth-status) cmd_auth_status ;;
     clear-cache) cmd_clear_cache ;;
+    clear-cache-system) cmd_clear_cache_system ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
     restart) cmd_restart ;;
     status) cmd_status ;;
     logs) cmd_logs ;;
     doctor) cmd_doctor ;;
+    start-system) cmd_start_system "$@" ;;
+    stop-system) cmd_stop_system "$@" ;;
+    restart-system) cmd_restart_system "$@" ;;
+    status-system) cmd_status_system ;;
+    logs-system) cmd_logs_system ;;
+    doctor-system) cmd_doctor_system ;;
     uninstall) cmd_uninstall "$@" ;;
+    uninstall-system) cmd_uninstall_system "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "Unknown command: $cmd"; usage; exit 1 ;;
   esac

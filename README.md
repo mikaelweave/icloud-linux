@@ -50,7 +50,7 @@ You need:
 - Linux
 - Python 3 with `venv`
 - FUSE
-- `systemctl --user`
+- `systemctl --user` for workstation installs, or `systemctl` for root/container installs
 
 ### Debian / Ubuntu
 
@@ -95,6 +95,16 @@ If you prefer to do setup one step at a time:
 ./icloudctl start
 ```
 
+For a root-owned container install that should run under the system service
+manager instead of `systemctl --user`:
+
+```bash
+./icloudctl init-system /root/iCloud
+./icloudctl configure your_apple_id@example.com
+./icloudctl auth
+./icloudctl start-system
+```
+
 ## Why Authentication Is Split Into Two Steps
 
 Systemd user services are non-interactive. They cannot pause and wait for a 2FA code.
@@ -111,6 +121,13 @@ If Apple expires your session, run:
 ./icloudctl restart
 ```
 
+To see how old the saved session is and roughly how many days remain before
+reauthentication is likely needed, run:
+
+```bash
+./icloudctl auth-status
+```
+
 ## Everyday Commands
 
 ```bash
@@ -118,6 +135,7 @@ If Apple expires your session, run:
 ./icloudctl stop
 ./icloudctl restart
 ./icloudctl status
+./icloudctl auth-status
 ./icloudctl logs
 ./icloudctl doctor
 ./icloudctl clear-cache
@@ -130,6 +148,7 @@ What they do:
 - `stop`: stops the service and unmounts the folder
 - `restart`: restarts the service cleanly
 - `status`: shows whether the service is running
+- `auth-status`: reports cookie/session age and approximate days left
 - `logs`: tails the service logs
 - `doctor`: checks common setup issues
 - `clear-cache`: deletes the local mirror and sync database, then rebuilds them on next start
@@ -225,6 +244,55 @@ You can watch logs in another terminal:
 ```
 
 Normal activity should mostly look like background crawl, hydration, and sync logs rather than a separate remote fetch for every file operation.
+
+### OpenClaw, Incus, or a VM user cannot write into the mounted vault
+
+If you are sharing the mounted vault into another user or container, enable FUSE mount sharing in `~/.config/icloud-linux/config.yaml`:
+
+```yaml
+fuse_options:
+  allow_other: true
+```
+
+Then make sure `/etc/fuse.conf` on the host contains:
+
+```text
+user_allow_other
+```
+
+If the other environment only needs read access, the default permission layout is fine.
+If the host does **not** need the files and only the guest will use them, it is usually simpler to run `icloud-linux` inside that guest instead of exporting a host-managed mount.
+If you want another VM or container user to create folders and files through the mount, either:
+
+1. map the presented owner to that user's numeric IDs, or
+2. relax the shared file and directory modes.
+
+Example for a VM user with UID/GID `1000`:
+
+```yaml
+permissions:
+  uid: 1000
+  gid: 1000
+  file_mode: "0644"
+  dir_mode: "0755"
+```
+
+Example for broader shared write access when IDs do not line up cleanly:
+
+```yaml
+permissions:
+  file_mode: "0666"
+  dir_mode: "0777"
+```
+
+Restart the service after changing the config:
+
+```bash
+./icloudctl restart
+```
+
+Newly created and hydrated files are normalized to the configured `permissions.file_mode` and `permissions.dir_mode` values so a restrictive service umask does not leave newer vault files stuck at `0600`.
+Do **not** treat `~/.cache/icloud-linux/mirror` as a writable multi-user share: direct writes to the mirror bypass the normal FUSE dirty-tracking path, so the supported writable path is the mounted filesystem itself.
 
 ## Notes
 

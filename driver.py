@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import closing
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +43,8 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 IO_CHUNK_SIZE = 1024 * 1024
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
+DEFAULT_FILE_MODE = 0o644
+DEFAULT_DIR_MODE = 0o755
 
 
 class Stat(fuse.Stat):
@@ -75,6 +78,54 @@ def parse_remote_time(value):
 
 def calendar_timegm(timetuple):
     return int(datetime.datetime(*timetuple[:6], tzinfo=datetime.timezone.utc).timestamp())
+
+
+def parse_permission_mode(value, default, label):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an octal mode, not a boolean")
+    if isinstance(value, int):
+        mode = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{label} must not be empty")
+        if text.lower().startswith("0o"):
+            mode = int(text, 8)
+        elif all(char in "01234567" for char in text):
+            mode = int(text, 8)
+        else:
+            raise ValueError(f"{label} must be an octal mode like 0755")
+    else:
+        raise ValueError(f"{label} must be an int or octal string")
+    if mode < 0 or mode > 0o777:
+        raise ValueError(f"{label} must be between 0000 and 0777")
+    return mode
+
+
+def parse_optional_int(value, default, label):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer, not a boolean")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer") from exc
+
+
+def resolve_permissions_config(permissions):
+    if permissions is None:
+        permissions = {}
+    if not isinstance(permissions, dict):
+        raise ValueError("permissions must be a mapping")
+    return {
+        "uid": parse_optional_int(permissions.get("uid"), os.getuid(), "permissions.uid"),
+        "gid": parse_optional_int(permissions.get("gid"), os.getgid(), "permissions.gid"),
+        "file_mode": parse_permission_mode(permissions.get("file_mode"), DEFAULT_FILE_MODE, "permissions.file_mode"),
+        "dir_mode": parse_permission_mode(permissions.get("dir_mode"), DEFAULT_DIR_MODE, "permissions.dir_mode"),
+    }
 
 
 def sha256_file(path):
@@ -551,12 +602,39 @@ class SyncState:
 
 
 class LocalMirror:
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, file_mode=DEFAULT_FILE_MODE, dir_mode=DEFAULT_DIR_MODE):
         self.cache_dir = cache_dir
         self.root = os.path.join(cache_dir, "mirror")
         self.tmp_dir = os.path.join(cache_dir, "tmp")
+        self.file_mode = file_mode
+        self.dir_mode = dir_mode
         os.makedirs(self.root, exist_ok=True)
         os.makedirs(self.tmp_dir, exist_ok=True)
+        self._normalize_directory_path(self.root)
+
+    def _set_mode_if_needed(self, local, mode):
+        current_mode = stat.S_IMODE(os.lstat(local).st_mode)
+        if current_mode != mode:
+            os.chmod(local, mode)
+
+    def _normalize_directory_path(self, local):
+        current = local
+        while current.startswith(self.root):
+            if os.path.isdir(current):
+                self._set_mode_if_needed(current, self.dir_mode)
+            if current == self.root:
+                break
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+    def _normalize_file_path(self, local):
+        self._set_mode_if_needed(local, self.file_mode)
+        self._normalize_directory_path(os.path.dirname(local))
+
+    def normalize_file(self, path):
+        self._normalize_file_path(self.local_path(path))
 
     def local_path(self, path):
         normalized = os.path.normpath(path)
@@ -575,10 +653,13 @@ class LocalMirror:
         if os.path.exists(local) and not os.path.isdir(local):
             os.unlink(local)
         os.makedirs(local, exist_ok=True)
+        self._normalize_directory_path(local)
 
     def ensure_parent(self, path):
         parent = os.path.dirname(path) or "/"
-        os.makedirs(self.local_path(parent), exist_ok=True)
+        parent_local = self.local_path(parent)
+        os.makedirs(parent_local, exist_ok=True)
+        self._normalize_directory_path(parent_local)
 
     def materialize_placeholder(self, path, size, mtime):
         local = self.local_path(path)
@@ -588,6 +669,7 @@ class LocalMirror:
         with open(local, "wb") as handle:
             handle.truncate(int(size or 0))
         os.utime(local, (mtime, mtime))
+        self._normalize_file_path(local)
 
     def write_atomic_bytes(self, path, content, mtime=None):
         self.ensure_parent(path)
@@ -599,6 +681,7 @@ class LocalMirror:
             os.replace(tmp_path, local)
             if mtime is not None:
                 os.utime(local, (mtime, mtime))
+            self._normalize_file_path(local)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -613,6 +696,7 @@ class LocalMirror:
             os.replace(tmp_path, local)
             if mtime is not None:
                 os.utime(local, (mtime, mtime))
+            self._normalize_file_path(local)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -631,6 +715,7 @@ class LocalMirror:
             handle.seek(offset)
             handle.write(buf)
             handle.flush()
+        self._normalize_file_path(local)
         return len(buf)
 
     def truncate(self, path, length):
@@ -639,12 +724,14 @@ class LocalMirror:
         mode = "r+b" if os.path.exists(local) else "w+b"
         with open(local, mode) as handle:
             handle.truncate(length)
+        self._normalize_file_path(local)
 
     def create_file(self, path):
         self.ensure_parent(path)
         local = self.local_path(path)
         with open(local, "ab"):
             pass
+        self._normalize_file_path(local)
 
     def listdir(self, path):
         return os.listdir(self.local_path(path))
@@ -789,12 +876,14 @@ class ICloudSyncEngine:
             if entry["tombstone"]:
                 continue
             if self._is_directory_type(entry["type"]):
-                if not self.mirror.is_dir(path):
-                    self.mirror.ensure_dir(path)
+                was_dir = self.mirror.is_dir(path)
+                self.mirror.ensure_dir(path)
+                if not was_dir:
                     recreated_dirs += 1
                 continue
 
             if self.mirror.exists(path):
+                self.mirror.normalize_file(path)
                 stats = self.mirror.stat_local(path)
                 checksum = entry.get("local_sha256")
                 hydrated = bool(entry["hydrated"])
@@ -924,13 +1013,15 @@ class ICloudSyncEngine:
         snapshot = {}
         queue = deque()
         root = self.api.drive.root
-        queue.append((root, "/"))
+        queue.append((root, "/", root.data.get("shareID")))
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
 
         while queue:
-            node, path = queue.popleft()
+            node, path, inherited_shareid = queue.popleft()
+            if inherited_shareid and not node.data.get("shareID"):
+                node.data = {**node.data, "shareID": inherited_shareid}
             scanned_folders += 1
             try:
                 children = node.get_children(force=True)
@@ -940,10 +1031,16 @@ class ICloudSyncEngine:
 
             for child in children:
                 child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
-                meta = self._node_to_meta(child, child_path)
+                meta = self._node_to_meta(
+                    child,
+                    child_path,
+                    inherited_shareid=node.data.get("shareID") or inherited_shareid,
+                )
+                if meta.get("remote_shareid") and not child.data.get("shareID"):
+                    child.data = {**child.data, "shareID": meta["remote_shareid"]}
                 snapshot[meta["remote_drivewsid"]] = meta
                 if self._is_directory_type(meta["type"]):
-                    queue.append((child, child_path))
+                    queue.append((child, child_path, meta.get("remote_shareid")))
 
             now = time.time()
             if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
@@ -1307,8 +1404,22 @@ class ICloudSyncEngine:
                 synced_path=entry.get("synced_path"),
             )
             if not entry["remote_drivewsid"]:
-                parent_node.mkdir(os.path.basename(entry["path"]))
-                meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
+                created_node = self._create_remote_directory(
+                    parent_node,
+                    os.path.basename(entry["path"]),
+                )
+                meta = (
+                    self._node_to_meta(
+                        created_node,
+                        entry["path"],
+                        inherited_shareid=parent_node.data.get("shareID"),
+                    )
+                    if created_node is not None
+                    else self._reconcile_child_meta(
+                        os.path.dirname(entry["path"]) or "/",
+                        os.path.basename(entry["path"]),
+                    )
+                )
                 self.state.mark_clean(entry["path"], meta)
                 self._log_sync("directory-create-complete", path=entry["path"])
                 return
@@ -1350,11 +1461,16 @@ class ICloudSyncEngine:
                     pass
 
             with open(self.mirror.local_path(entry["path"]), "rb") as handle:
-                parent_node.upload(
-                    NamedFileStream(handle, os.path.basename(entry["path"]))
-                )
+                stream = NamedFileStream(handle, os.path.basename(entry["path"]))
+                if parent_node.data.get("shareID") and not entry["remote_drivewsid"]:
+                    self._upload_shared_file(parent_node, stream)
+                else:
+                    parent_node.upload(stream)
 
-            meta = self._refresh_child_meta(os.path.dirname(entry["path"]) or "/", os.path.basename(entry["path"]))
+            meta = self._reconcile_child_meta(
+                os.path.dirname(entry["path"]) or "/",
+                os.path.basename(entry["path"]),
+            )
             checksum = self.mirror.file_sha256(entry["path"])
             self.state.mark_clean(entry["path"], meta, checksum)
             self._log_sync("file-sync-complete", path=entry["path"], size=meta.get("size"))
@@ -1376,7 +1492,7 @@ class ICloudSyncEngine:
             destination = self._remote_node_for_path(new_parent)
             if destination is None:
                 raise RuntimeError(f"Remote parent not available for {new_parent}")
-            self.api.drive.move_nodes_to_node([node], destination)
+            self._move_remote_nodes([node], destination)
             node = self._refresh_node_by_id(
                 entry["remote_drivewsid"],
                 entry.get("remote_shareid"),
@@ -1399,17 +1515,146 @@ class ICloudSyncEngine:
             return None
         return self._node_from_entry(parent_entry)
 
-    def _refresh_child_meta(self, parent_path, child_name):
+    def _post_drive_service(self, endpoint, payload, shareid=None, content_type_text=False):
+        request_payload = dict(payload)
+        if shareid:
+            request_payload["shareID"] = shareid
+        headers = {"Content-Type": "text/plain"} if content_type_text else None
+        request = self.api.drive.session.post(
+            self.api.drive.service_root + endpoint,
+            params=self.api.drive.params,
+            headers=headers,
+            json=request_payload,
+        )
+        self.api.drive._raise_if_error(request)
+        return request.json()
+
+    def _create_remote_directory(self, parent_node, name):
+        shareid = parent_node.data.get("shareID")
+        if shareid:
+            response = self._post_drive_service(
+                "/createFolders",
+                {
+                    "destinationDrivewsId": parent_node.data["drivewsid"],
+                    "folders": [
+                        {
+                            "clientId": f"FOLDER::UNKNOWN_ZONE::TempId-{uuid.uuid4()}",
+                            "name": name,
+                        }
+                    ],
+                },
+                shareid=shareid,
+                content_type_text=True,
+            )
+        else:
+            response = parent_node.mkdir(name)
+        folders = response.get("folders") or []
+        if not folders:
+            return None
+        folder = folders[0]
+        if shareid and not folder.get("shareID"):
+            folder = {**folder, "shareID": shareid}
+        return DriveNode(self.api.drive, folder)
+
+    def _move_remote_nodes(self, nodes, destination):
+        shareid = destination.data.get("shareID")
+        if not shareid:
+            return self.api.drive.move_nodes_to_node(nodes, destination)
+        return self._post_drive_service(
+            "/moveItems",
+            {
+                "destinationDrivewsId": destination.data["drivewsid"],
+                "items": [
+                    {
+                        "drivewsid": node.data["drivewsid"],
+                        "etag": node.data["etag"],
+                        "clientId": node.data["drivewsid"],
+                    }
+                    for node in nodes
+                ],
+            },
+            shareid=shareid,
+        )
+
+    def _cleanup_staging_node(self, staging_node):
+        try:
+            children = list(staging_node.get_children(force=True))
+        except Exception as exc:
+            self.logger.warning("Failed listing staging folder %s: %s", staging_node.name, exc)
+            children = []
+        for child in children:
+            try:
+                child.delete()
+            except Exception as exc:
+                self.logger.warning("Failed deleting staged item %s: %s", child.name, exc)
+        try:
+            staging_node.delete()
+        except Exception as exc:
+            self.logger.warning("Failed deleting staging folder %s: %s", staging_node.name, exc)
+
+    def _upload_shared_file(self, parent_node, file_object):
+        staging_name = f".icloud-linux-stage-{uuid.uuid4().hex}"
+        staging_node = self._create_remote_directory(self.api.drive.root, staging_name)
+        if staging_node is None:
+            raise RuntimeError("Failed creating shared upload staging directory")
+        try:
+            staging_node.upload(file_object)
+            target_name = os.path.basename(file_object.name)
+            staged_child = None
+            for child in staging_node.get_children(force=True):
+                if child.name == target_name:
+                    staged_child = child
+                    break
+            if staged_child is None:
+                raise KeyError(f"Missing staged upload {target_name} in /{staging_name}")
+            self._move_remote_nodes([staged_child], parent_node)
+        finally:
+            self._cleanup_staging_node(staging_node)
+
+    def _shareid_for_path(self, path):
+        if path in ("", "/"):
+            return None
+        entry = self.state.get_entry(path)
+        if not entry:
+            return None
+        return entry.get("remote_shareid")
+
+    def _refresh_child_meta(self, parent_path, child_name, inherited_shareid=None):
         parent = self._remote_node_for_path(parent_path)
         if parent is None:
             raise RuntimeError(f"Missing remote parent: {parent_path}")
+        if inherited_shareid and not parent.data.get("shareID"):
+            parent.data = {**parent.data, "shareID": inherited_shareid}
         for child in parent.get_children(force=True):
             if child.name == child_name:
+                meta_shareid = child.data.get("shareID") or inherited_shareid
+                if meta_shareid and not child.data.get("shareID"):
+                    child.data = {**child.data, "shareID": meta_shareid}
                 return self._node_to_meta(
                     child,
                     "/" + child.name if parent_path == "/" else parent_path.rstrip("/") + "/" + child.name,
+                    inherited_shareid=meta_shareid,
                 )
         raise KeyError(f"Missing child {child_name} under {parent_path}")
+
+    def _reconcile_child_meta(self, parent_path, child_name):
+        inherited_shareid = self._shareid_for_path(parent_path)
+        try:
+            return self._refresh_child_meta(
+                parent_path,
+                child_name,
+                inherited_shareid=inherited_shareid,
+            )
+        except KeyError:
+            if not inherited_shareid:
+                raise
+            snapshot = self._crawl_remote_snapshot()
+            self._apply_remote_snapshot(snapshot)
+            path = "/" + child_name if parent_path == "/" else parent_path.rstrip("/") + "/" + child_name
+            entry = self.state.get_entry(path)
+            if entry and entry.get("remote_drivewsid"):
+                return entry
+            raise
 
     def _remote_node_for_path(self, path):
         if path == "/" or path == "":
@@ -1436,13 +1681,14 @@ class ICloudSyncEngine:
         }
         return DriveNode(self.api.drive, data)
 
-    def _node_to_meta(self, node, path):
+    def _node_to_meta(self, node, path, inherited_shareid=None):
         data = node.data
         node_type = data.get("type", "FILE").lower()
         if self._is_directory_type(node_type):
             size = 0
         else:
             size = int(data.get("size", 0) or 0)
+        shareid = data.get("shareID") or inherited_shareid
         return {
             "path": path,
             "type": node_type,
@@ -1451,7 +1697,7 @@ class ICloudSyncEngine:
             "remote_docwsid": data.get("docwsid"),
             "remote_etag": data.get("etag"),
             "remote_zone": data.get("zone"),
-            "remote_shareid": data.get("shareID"),
+            "remote_shareid": shareid,
             "size": size,
             "mtime": parse_remote_time(data.get("dateModified")),
         }
@@ -1492,6 +1738,10 @@ class ICloudFS(Fuse):
         self.mirror = None
         self.state = None
         self.sync_engine = None
+        self.mount_uid = os.getuid()
+        self.mount_gid = os.getgid()
+        self.file_mode = DEFAULT_FILE_MODE
+        self.dir_mode = DEFAULT_DIR_MODE
 
     def _log_file_op(self, op, path=None, level=logging.INFO, **fields):
         payload = {}
@@ -1503,6 +1753,9 @@ class ICloudFS(Fuse):
             self.logger.log(level, "file-op %s %s", op, details)
             return
         self.logger.log(level, "file-op %s", op)
+
+    def _is_directory_type(self, node_type):
+        return (node_type or "").lower() in DIRECTORY_NODE_TYPES
 
     def shutdown(self):
         if self.sync_engine is not None:
@@ -1566,7 +1819,7 @@ class ICloudFS(Fuse):
         remote_refresh_interval_seconds,
         warmup_workers,
     ):
-        self.mirror = LocalMirror(cache_dir)
+        self.mirror = LocalMirror(cache_dir, file_mode=self.file_mode, dir_mode=self.dir_mode)
         state_path = os.path.join(cache_dir, "state.sqlite3")
         self.state = SyncState(state_path)
         self.sync_engine = ICloudSyncEngine(
@@ -1582,6 +1835,39 @@ class ICloudFS(Fuse):
         )
         self.sync_engine.start()
 
+    def apply_fuse_options(self, fuse_options):
+        if not fuse_options:
+            return
+        if not isinstance(fuse_options, dict):
+            raise ValueError("fuse_options must be a mapping")
+
+        for option, value in fuse_options.items():
+            if not isinstance(option, str) or not option:
+                raise ValueError("fuse option names must be non-empty strings")
+            if isinstance(value, bool):
+                if value:
+                    self.fuse_args.add(option)
+                continue
+            if value is None:
+                continue
+            self.fuse_args.add(option, value)
+
+    def apply_permissions_config(self, permissions):
+        resolved = resolve_permissions_config(permissions)
+        self.mount_uid = resolved["uid"]
+        self.mount_gid = resolved["gid"]
+        self.file_mode = resolved["file_mode"]
+        self.dir_mode = resolved["dir_mode"]
+
+    def _permission_mode_for_entry(self, entry_type):
+        return self.dir_mode if self._is_directory_type(entry_type) else self.file_mode
+
+    def _apply_presented_permissions(self, attrs, entry_type):
+        file_type = stat.S_IFDIR if self._is_directory_type(entry_type) else stat.S_IFREG
+        attrs.st_mode = file_type | self._permission_mode_for_entry(entry_type)
+        attrs.st_uid = self.mount_uid
+        attrs.st_gid = self.mount_gid
+
     def getattr(self, path):
         now = int(time.time())
         entry = self.state.get_entry(path) if self.state else None
@@ -1592,14 +1878,12 @@ class ICloudFS(Fuse):
                 stats = self.mirror.stat_local(path)
                 self._apply_os_stat(attrs, stats)
             except Exception:
-                attrs.st_mode = stat.S_IFDIR | 0o755
+                self._apply_presented_permissions(attrs, "folder")
                 attrs.st_nlink = 2
                 attrs.st_size = 0
                 attrs.st_ctime = now
                 attrs.st_mtime = now
                 attrs.st_atime = now
-                attrs.st_uid = os.getuid()
-                attrs.st_gid = os.getgid()
             return attrs
 
         if self.mirror and self.mirror.exists(path):
@@ -1612,14 +1896,12 @@ class ICloudFS(Fuse):
             return attrs
 
         if entry and not entry["tombstone"]:
-            attrs.st_mode = (stat.S_IFDIR | 0o755) if entry["type"] == "folder" else (stat.S_IFREG | 0o644)
-            attrs.st_nlink = 2 if entry["type"] == "folder" else 1
+            self._apply_presented_permissions(attrs, entry["type"])
+            attrs.st_nlink = 2 if self._is_directory_type(entry["type"]) else 1
             attrs.st_size = entry["size"]
             attrs.st_ctime = entry["mtime"] or now
             attrs.st_mtime = entry["mtime"] or now
             attrs.st_atime = now
-            attrs.st_uid = os.getuid()
-            attrs.st_gid = os.getgid()
             return attrs
 
         return -errno.ENOENT
@@ -1894,12 +2176,11 @@ class ICloudFS(Fuse):
         attrs.st_ino = stats.st_ino
         attrs.st_dev = stats.st_dev
         attrs.st_nlink = stats.st_nlink
-        attrs.st_uid = stats.st_uid
-        attrs.st_gid = stats.st_gid
         attrs.st_size = stats.st_size
         attrs.st_atime = int(stats.st_atime)
         attrs.st_mtime = int(stats.st_mtime)
         attrs.st_ctime = int(stats.st_ctime)
+        self._apply_presented_permissions(attrs, "folder" if stat.S_ISDIR(stats.st_mode) else "file")
 
 
 def parse_config(config_path):
@@ -1943,6 +2224,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     logging.getLogger("pyicloud.base").addFilter(IgnoreIcdrsWarning())
 
     config = parse_config(args.config)
+    try:
+        fs.apply_fuse_options(config.get("fuse_options"))
+        fs.apply_permissions_config(config.get("permissions"))
+    except ValueError as exc:
+        logger.error("Invalid configuration: %s", exc)
+        sys.exit(1)
     username = config.get("username")
     password = config.get("password")
     if not username or not password:

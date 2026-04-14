@@ -29,8 +29,17 @@ warmup_workers: 1
 # Persistent cookie/session directory used after one-time 2FA bootstrap
 cookie_dir: "~/.config/icloud-linux/cookies"
 
+# Presented ownership and permissions for the mounted files.
+# Set uid/gid to the VM or container user's numeric IDs if you want that user
+# to be treated as the owner inside the mount view.
+permissions:
+  file_mode: "0644"
+  dir_mode: "0755"
+  # uid: 1000
+  # gid: 1000
+
 # FUSE options
 fuse_options:
-  allow_other: false  # Set to true to allow other users to access the mount
+  allow_other: false  # Set to true to share the mount with other users/containers; requires "user_allow_other" in /etc/fuse.conf on many hosts
   ro: false           # Set to true for read-only access
   nonempty: true      # Allow mounting over a non-empty directory
