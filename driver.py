@@ -171,6 +171,8 @@ class SyncState:
                     remote_etag TEXT,
                     remote_zone TEXT,
                     remote_shareid TEXT,
+                    remote_itemid TEXT,
+                    remote_unified_token TEXT,
                     size INTEGER NOT NULL DEFAULT 0,
                     mtime INTEGER NOT NULL DEFAULT 0,
                     hydrated INTEGER NOT NULL DEFAULT 0,
@@ -201,6 +203,12 @@ class SyncState:
             }
             if "remote_shareid" not in columns:
                 self.conn.execute("ALTER TABLE entries ADD COLUMN remote_shareid TEXT")
+            if "remote_itemid" not in columns:
+                self.conn.execute("ALTER TABLE entries ADD COLUMN remote_itemid TEXT")
+            if "remote_unified_token" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN remote_unified_token TEXT"
+                )
             self.conn.commit()
 
     def upsert_entry(self, entry):
@@ -213,6 +221,8 @@ class SyncState:
             "remote_etag": entry.get("remote_etag"),
             "remote_zone": entry.get("remote_zone"),
             "remote_shareid": self._encode_shareid(entry.get("remote_shareid")),
+            "remote_itemid": entry.get("remote_itemid"),
+            "remote_unified_token": entry.get("remote_unified_token"),
             "size": int(entry.get("size", 0) or 0),
             "mtime": int(entry.get("mtime", 0) or 0),
             "hydrated": int(bool(entry.get("hydrated", False))),
@@ -227,11 +237,13 @@ class SyncState:
                 """
                 INSERT INTO entries (
                     path, type, parent_path, remote_drivewsid, remote_docwsid, remote_etag,
-                    remote_zone, remote_shareid, size, mtime, hydrated, dirty, tombstone, local_sha256,
+                    remote_zone, remote_shareid, remote_itemid, remote_unified_token,
+                    size, mtime, hydrated, dirty, tombstone, local_sha256,
                     last_synced_at, synced_path
                 ) VALUES (
                     :path, :type, :parent_path, :remote_drivewsid, :remote_docwsid, :remote_etag,
-                    :remote_zone, :remote_shareid, :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
+                    :remote_zone, :remote_shareid, :remote_itemid, :remote_unified_token,
+                    :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
                     :last_synced_at, :synced_path
                 )
                 ON CONFLICT(path) DO UPDATE SET
@@ -242,6 +254,8 @@ class SyncState:
                     remote_etag = excluded.remote_etag,
                     remote_zone = excluded.remote_zone,
                     remote_shareid = excluded.remote_shareid,
+                    remote_itemid = excluded.remote_itemid,
+                    remote_unified_token = excluded.remote_unified_token,
                     size = excluded.size,
                     mtime = excluded.mtime,
                     hydrated = excluded.hydrated,
@@ -364,6 +378,9 @@ class SyncState:
                     remote_docwsid = COALESCE(?, remote_docwsid),
                     remote_etag = COALESCE(?, remote_etag),
                     remote_zone = COALESCE(?, remote_zone),
+                    remote_shareid = COALESCE(?, remote_shareid),
+                    remote_itemid = COALESCE(?, remote_itemid),
+                    remote_unified_token = COALESCE(?, remote_unified_token),
                     size = COALESCE(?, size),
                     mtime = COALESCE(?, mtime),
                     local_sha256 = COALESCE(?, local_sha256),
@@ -376,6 +393,9 @@ class SyncState:
                     remote_meta.get("remote_docwsid"),
                     remote_meta.get("remote_etag"),
                     remote_meta.get("remote_zone"),
+                    self._encode_shareid(remote_meta.get("remote_shareid")),
+                    remote_meta.get("remote_itemid"),
+                    remote_meta.get("remote_unified_token"),
                     remote_meta.get("size"),
                     remote_meta.get("mtime"),
                     local_sha256,
@@ -522,6 +542,8 @@ class SyncState:
                         remote_etag = NULL,
                         remote_zone = NULL,
                         remote_shareid = NULL,
+                        remote_itemid = NULL,
+                        remote_unified_token = NULL,
                         synced_path = NULL,
                         dirty = 1,
                         tombstone = 0
@@ -541,6 +563,8 @@ class SyncState:
                     remote_etag = NULL,
                     remote_zone = NULL,
                     remote_shareid = NULL,
+                    remote_itemid = NULL,
+                    remote_unified_token = NULL,
                     synced_path = NULL,
                     dirty = 1,
                     tombstone = 0
@@ -1383,8 +1407,7 @@ class ICloudSyncEngine:
         self._log_sync("delete-start", path=entry["path"], remote=bool(entry["remote_drivewsid"]))
         if entry["remote_drivewsid"]:
             try:
-                node = self._node_from_entry(entry)
-                node.delete()
+                self._delete_remote_node(self._node_from_entry(entry))
             except Exception as exc:
                 self.logger.error("Failed deleting remote path %s: %s", entry["path"], exc)
                 return
@@ -1403,6 +1426,7 @@ class ICloudSyncEngine:
                 remote_exists=bool(entry["remote_drivewsid"]),
                 synced_path=entry.get("synced_path"),
             )
+            is_shared = bool(entry.get("remote_shareid") or parent_node.data.get("shareID"))
             if not entry["remote_drivewsid"]:
                 created_node = self._create_remote_directory(
                     parent_node,
@@ -1425,6 +1449,10 @@ class ICloudSyncEngine:
                 return
 
             if entry["synced_path"] and entry["synced_path"] != entry["path"]:
+                if is_shared:
+                    self._sync_shared_directory(entry, parent_node)
+                    self._log_sync("directory-sync-complete", path=entry["path"])
+                    return
                 self._sync_move_or_rename(entry)
             self.state.mark_synced_subtree(entry["path"])
             self._log_sync("directory-sync-complete", path=entry["path"])
@@ -1449,30 +1477,36 @@ class ICloudSyncEngine:
                 return
 
             self.ensure_local_file(entry["path"])
+            is_shared = bool(entry.get("remote_shareid") or parent_node.data.get("shareID"))
 
-            if entry["remote_drivewsid"] and entry["synced_path"] and entry["synced_path"] != entry["path"]:
+            if (
+                entry["remote_drivewsid"]
+                and entry["synced_path"]
+                and entry["synced_path"] != entry["path"]
+                and not is_shared
+            ):
                 self._sync_move_or_rename(entry)
                 entry = self.state.get_entry(entry["path"])
 
-            if entry["remote_drivewsid"]:
-                try:
-                    self._node_from_entry(entry).delete()
-                except Exception:
-                    pass
+            if is_shared:
+                meta = self._sync_shared_file(entry, parent_node)
+            else:
+                if entry["remote_drivewsid"]:
+                    try:
+                        self._delete_remote_node(self._node_from_entry(entry))
+                    except Exception:
+                        pass
 
-            with open(self.mirror.local_path(entry["path"]), "rb") as handle:
-                stream = NamedFileStream(handle, os.path.basename(entry["path"]))
-                if parent_node.data.get("shareID") and not entry["remote_drivewsid"]:
-                    self._upload_shared_file(parent_node, stream)
-                else:
+                with open(self.mirror.local_path(entry["path"]), "rb") as handle:
+                    stream = NamedFileStream(handle, os.path.basename(entry["path"]))
                     parent_node.upload(stream)
 
-            meta = self._reconcile_child_meta(
-                os.path.dirname(entry["path"]) or "/",
-                os.path.basename(entry["path"]),
-            )
-            checksum = self.mirror.file_sha256(entry["path"])
-            self.state.mark_clean(entry["path"], meta, checksum)
+                meta = self._reconcile_child_meta(
+                    os.path.dirname(entry["path"]) or "/",
+                    os.path.basename(entry["path"]),
+                )
+                checksum = self.mirror.file_sha256(entry["path"])
+                self.state.mark_clean(entry["path"], meta, checksum)
             self._log_sync("file-sync-complete", path=entry["path"], size=meta.get("size"))
         except Exception as exc:
             self.logger.error("Failed syncing file %s: %s", entry["path"], exc)
@@ -1500,6 +1534,51 @@ class ICloudSyncEngine:
         if old_name != new_name:
             node.rename(new_name)
         self._log_sync("move-complete", path=synced_path, target_path=entry["path"])
+
+    def _sync_shared_directory(self, entry, parent_node):
+        if entry.get("remote_shareid") and entry.get("remote_shareid") != parent_node.data.get("shareID"):
+            raise RuntimeError(
+                f"Cross-share directory moves are not supported for {entry['path']}"
+            )
+        old_node = self._node_from_entry(entry)
+        created_node = self._create_remote_directory(
+            parent_node,
+            os.path.basename(entry["path"]),
+        )
+        if created_node is None:
+            raise RuntimeError(f"Failed creating shared directory {entry['path']}")
+        children = list(old_node.get_children(force=True))
+        if children:
+            self._move_remote_nodes(children, created_node)
+        self._delete_remote_node(old_node)
+        meta = self._node_to_meta(
+            created_node,
+            entry["path"],
+            inherited_shareid=parent_node.data.get("shareID"),
+        )
+        self.state.mark_clean(entry["path"], meta)
+        self.state.mark_synced_subtree(entry["path"])
+
+    def _sync_shared_file(self, entry, parent_node):
+        old_node = self._node_from_entry(entry) if entry.get("remote_drivewsid") else None
+        synced_path = entry.get("synced_path")
+        target_parent_path = os.path.dirname(entry["path"]) or "/"
+        with open(self.mirror.local_path(entry["path"]), "rb") as handle:
+            stream = NamedFileStream(handle, os.path.basename(entry["path"]))
+            if old_node is not None and synced_path == entry["path"]:
+                self._delete_remote_node(old_node)
+                self._upload_file_to_parent(parent_node, stream)
+            else:
+                self._upload_file_to_parent(parent_node, stream)
+                if old_node is not None:
+                    self._delete_remote_node(old_node)
+        meta = self._reconcile_child_meta(
+            target_parent_path,
+            os.path.basename(entry["path"]),
+        )
+        checksum = self.mirror.file_sha256(entry["path"])
+        self.state.mark_clean(entry["path"], meta, checksum)
+        return meta
 
     def _ensure_remote_parent(self, path):
         parent_path = os.path.dirname(path) or "/"
@@ -1576,7 +1655,39 @@ class ICloudSyncEngine:
             shareid=shareid,
         )
 
-    def _cleanup_staging_node(self, staging_node):
+    def _put_document_item(self, item_id, payload):
+        request = self.api.drive.session.put(
+            f"{self.api.drive._document_root}/v1/item/{item_id}",
+            headers={"Content-Type": "text/plain"},
+            data=json.dumps(payload),
+        )
+        self.api.drive._raise_if_error(request)
+        return request.json()
+
+    def _shared_item_id(self, node):
+        item_id = node.data.get("item_id")
+        if item_id:
+            return item_id
+        refreshed = self._refresh_node_by_id(
+            node.data["drivewsid"],
+            node.data.get("shareID"),
+        )
+        node.data = {**node.data, **refreshed.data}
+        item_id = node.data.get("item_id")
+        if not item_id:
+            raise RuntimeError(f"Missing shared item id for {node.name}")
+        return item_id
+
+    def _delete_remote_node(self, node):
+        if node.data.get("shareID"):
+            self._put_document_item(
+                self._shared_item_id(node),
+                {"info_to_update": {"parent_item_id": "trash"}},
+            )
+            return
+        node.delete()
+
+    def _cleanup_temporary_upload_folder(self, staging_node):
         try:
             children = list(staging_node.get_children(force=True))
         except Exception as exc:
@@ -1592,7 +1703,10 @@ class ICloudSyncEngine:
         except Exception as exc:
             self.logger.warning("Failed deleting staging folder %s: %s", staging_node.name, exc)
 
-    def _upload_shared_file(self, parent_node, file_object):
+    def _upload_file_to_parent(self, parent_node, file_object):
+        if not parent_node.data.get("shareID"):
+            parent_node.upload(file_object)
+            return
         staging_name = f".icloud-linux-stage-{uuid.uuid4().hex}"
         staging_node = self._create_remote_directory(self.api.drive.root, staging_name)
         if staging_node is None:
@@ -1609,7 +1723,7 @@ class ICloudSyncEngine:
                 raise KeyError(f"Missing staged upload {target_name} in /{staging_name}")
             self._move_remote_nodes([staged_child], parent_node)
         finally:
-            self._cleanup_staging_node(staging_node)
+            self._cleanup_temporary_upload_folder(staging_node)
 
     def _shareid_for_path(self, path):
         if path in ("", "/"):
@@ -1675,6 +1789,8 @@ class ICloudSyncEngine:
             "etag": entry.get("remote_etag"),
             "zone": entry.get("remote_zone"),
             "shareID": entry.get("remote_shareid"),
+            "item_id": entry.get("remote_itemid"),
+            "unifiedToken": entry.get("remote_unified_token"),
             "size": int(entry.get("size", 0) or 0),
             "type": entry.get("type", "file").upper(),
             "name": os.path.basename(entry["path"].rstrip("/")) or "root",
@@ -1698,6 +1814,8 @@ class ICloudSyncEngine:
             "remote_etag": data.get("etag"),
             "remote_zone": data.get("zone"),
             "remote_shareid": shareid,
+            "remote_itemid": data.get("item_id"),
+            "remote_unified_token": data.get("unifiedToken"),
             "size": size,
             "mtime": parse_remote_time(data.get("dateModified")),
         }

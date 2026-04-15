@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -259,6 +260,8 @@ class DriverStateTests(unittest.TestCase):
                 "remote_etag": "etag-1",
                 "remote_zone": "zone-1",
                 "remote_shareid": {"share-zone": "abc"},
+                "remote_itemid": "item-1",
+                "remote_unified_token": "token-1",
                 "hydrated": False,
                 "dirty": False,
                 "tombstone": False,
@@ -269,6 +272,8 @@ class DriverStateTests(unittest.TestCase):
         entry = self.state.get_entry("/shared/a.txt")
 
         self.assertEqual(entry["remote_shareid"], {"share-zone": "abc"})
+        self.assertEqual(entry["remote_itemid"], "item-1")
+        self.assertEqual(entry["remote_unified_token"], "token-1")
 
     def test_existing_state_db_is_migrated_for_remote_shareid(self):
         legacy_db = os.path.join(self.root, "legacy.sqlite3")
@@ -300,7 +305,10 @@ class DriverStateTests(unittest.TestCase):
         migrated = SyncState(legacy_db)
         columns = migrated.conn.execute("PRAGMA table_info(entries)").fetchall()
 
-        self.assertIn("remote_shareid", {column["name"] for column in columns})
+        column_names = {column["name"] for column in columns}
+        self.assertIn("remote_shareid", column_names)
+        self.assertIn("remote_itemid", column_names)
+        self.assertIn("remote_unified_token", column_names)
 
 
 class SyncEngineStartupTests(unittest.TestCase):
@@ -458,6 +466,8 @@ class SyncEngineStartupTests(unittest.TestCase):
                 "remote_etag": "etag-1",
                 "remote_zone": "zone-1",
                 "remote_shareid": shareid,
+                "remote_itemid": "item-1",
+                "remote_unified_token": "token-1",
                 "size": 5,
             }
         )
@@ -465,6 +475,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine.api.drive.get_node_data.assert_not_called()
         self.assertEqual(node.data["docwsid"], "doc-1")
         self.assertEqual(node.data["shareID"], shareid)
+        self.assertEqual(node.data["item_id"], "item-1")
+        self.assertEqual(node.data["unifiedToken"], "token-1")
         self.assertEqual(node.data["size"], 5)
 
     def test_node_to_meta_inherits_parent_shareid_for_shared_child(self):
@@ -476,6 +488,8 @@ class SyncEngineStartupTests(unittest.TestCase):
             "docwsid": "documents",
             "etag": "etag-folder",
             "zone": "zone-1",
+            "item_id": "item-1",
+            "unifiedToken": "token-1",
             "dateModified": "2026-04-06T00:00:00Z",
         }
 
@@ -486,6 +500,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         )
 
         self.assertEqual(meta["remote_shareid"], shareid)
+        self.assertEqual(meta["remote_itemid"], "item-1")
+        self.assertEqual(meta["remote_unified_token"], "token-1")
 
     def test_ensure_local_file_streams_remote_content_in_chunks(self):
         self.state.upsert_entry(
@@ -564,7 +580,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
 
-    def test_sync_file_uses_staged_upload_for_new_shared_file(self):
+    def test_sync_file_uses_share_aware_upload_for_new_shared_file(self):
         shareid = {"share-zone": "abc"}
         self.mirror.create_file("/Shared/note.md")
         self.mirror.write("/Shared/note.md", b"hello world", 0)
@@ -604,7 +620,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         }
         self.engine._ensure_remote_parent = Mock(return_value=parent_node)
         self.engine.ensure_local_file = Mock()
-        self.engine._upload_shared_file = Mock()
+        self.engine._upload_file_to_parent = Mock()
         self.engine._reconcile_child_meta = Mock(
             return_value={
                 "path": "/Shared/note.md",
@@ -622,10 +638,123 @@ class SyncEngineStartupTests(unittest.TestCase):
 
         self.engine._sync_file(self.state.get_entry("/Shared/note.md"))
 
-        self.engine._upload_shared_file.assert_called_once()
-        stream = self.engine._upload_shared_file.call_args[0][1]
+        self.engine._upload_file_to_parent.assert_called_once()
+        self.assertIs(
+            self.engine._upload_file_to_parent.call_args[0][0],
+            parent_node,
+        )
+        stream = self.engine._upload_file_to_parent.call_args[0][1]
         self.assertEqual(stream.__class__.__name__, "NamedFileStream")
         self.assertEqual(stream.name, "note.md")
+
+    def test_sync_file_replaces_existing_shared_file_via_item_trash_then_upload(self):
+        shareid = {"share-zone": "abc"}
+        self.mirror.create_file("/Shared/note.md")
+        self.mirror.write("/Shared/note.md", b"hello world", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/Shared/note.md",
+                "type": "file",
+                "parent_path": "/Shared",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-1",
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/Shared/note.md",
+            }
+        )
+        parent_node = Mock()
+        parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
+        old_node = Mock()
+        old_node.data = {"drivewsid": "file-1", "shareID": shareid, "item_id": "item-1"}
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine._node_from_entry = Mock(return_value=old_node)
+        self.engine.ensure_local_file = Mock()
+        self.engine._reconcile_child_meta = Mock(
+            return_value={
+                "path": "/Shared/note.md",
+                "type": "file",
+                "parent_path": "/Shared",
+                "remote_drivewsid": "file-2",
+                "remote_docwsid": "doc-2",
+                "remote_etag": "etag-2",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-2",
+                "size": 11,
+                "mtime": 123,
+            }
+        )
+        calls = []
+        self.engine._delete_remote_node = Mock(side_effect=lambda node: calls.append(("delete", node)))
+        self.engine._upload_file_to_parent = Mock(
+            side_effect=lambda parent, stream: calls.append(("upload", parent, stream.name))
+        )
+
+        self.engine._sync_file(self.state.get_entry("/Shared/note.md"))
+
+        self.assertEqual([call[0] for call in calls], ["delete", "upload"])
+        self.assertEqual(calls[1][2], "note.md")
+
+    def test_sync_file_renamed_shared_file_uploads_before_deleting_old_remote(self):
+        shareid = {"share-zone": "abc"}
+        self.mirror.create_file("/SharedRenamed/note.md")
+        self.mirror.write("/SharedRenamed/note.md", b"hello world", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/SharedRenamed/note.md",
+                "type": "file",
+                "parent_path": "/SharedRenamed",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "etag-1",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-1",
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/SharedOld/note.md",
+            }
+        )
+        parent_node = Mock()
+        parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
+        old_node = Mock()
+        old_node.data = {"drivewsid": "file-1", "shareID": shareid, "item_id": "item-1"}
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine._node_from_entry = Mock(return_value=old_node)
+        self.engine.ensure_local_file = Mock()
+        self.engine._sync_move_or_rename = Mock()
+        self.engine._reconcile_child_meta = Mock(
+            return_value={
+                "path": "/SharedRenamed/note.md",
+                "type": "file",
+                "parent_path": "/SharedRenamed",
+                "remote_drivewsid": "file-2",
+                "remote_docwsid": "doc-2",
+                "remote_etag": "etag-2",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-2",
+                "size": 11,
+                "mtime": 123,
+            }
+        )
+        calls = []
+        self.engine._upload_file_to_parent = Mock(
+            side_effect=lambda parent, stream: calls.append(("upload", parent, stream.name))
+        )
+        self.engine._delete_remote_node = Mock(side_effect=lambda node: calls.append(("delete", node)))
+
+        self.engine._sync_file(self.state.get_entry("/SharedRenamed/note.md"))
+
+        self.assertEqual([call[0] for call in calls], ["upload", "delete"])
+        self.engine._sync_move_or_rename.assert_not_called()
 
     def test_create_remote_directory_includes_shareid_for_shared_parent(self):
         shareid = {"share-zone": "abc"}
@@ -673,7 +802,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(request_json["destinationDrivewsId"], "shared-root")
         self.assertEqual(request_json["items"][0]["drivewsid"], "file-1")
 
-    def test_upload_shared_file_stages_via_root_and_moves_into_shared_parent(self):
+    def test_upload_file_to_parent_stages_shared_uploads_via_root(self):
         shareid = {"share-zone": "abc"}
         parent_node = Mock()
         parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
@@ -690,7 +819,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         stream = io.BytesIO(b"hello")
         stream.name = "note.md"
 
-        self.engine._upload_shared_file(parent_node, stream)
+        self.engine._upload_file_to_parent(parent_node, stream)
 
         create_args = self.engine._create_remote_directory.call_args[0]
         self.assertIs(create_args[0], root_node)
@@ -698,6 +827,81 @@ class SyncEngineStartupTests(unittest.TestCase):
         staging_node.upload.assert_called_once_with(stream)
         self.engine._move_remote_nodes.assert_called_once_with([staged_child], parent_node)
         staging_node.delete.assert_called_once()
+
+    def test_delete_remote_node_uses_document_item_trash_for_shared_nodes(self):
+        node = Mock()
+        node.name = "shared-folder"
+        node.data = {
+            "drivewsid": "folder-1",
+            "shareID": {"share-zone": "abc"},
+            "item_id": "item-1",
+        }
+        response = Mock()
+        response.json.return_value = {"item_id": "item-1"}
+        self.engine.api.drive.session.put = Mock(return_value=response)
+        self.engine.api.drive._raise_if_error = Mock()
+
+        self.engine._delete_remote_node(node)
+
+        call = self.engine.api.drive.session.put.call_args
+        self.assertTrue(call.args[0].endswith("/v1/item/item-1"))
+        self.assertEqual(call.kwargs["headers"]["Content-Type"], "text/plain")
+        self.assertEqual(
+            json.loads(call.kwargs["data"]),
+            {"info_to_update": {"parent_item_id": "trash"}},
+        )
+
+    def test_sync_shared_directory_recreates_remote_folder_and_trashes_old_one(self):
+        shareid = {"share-zone": "abc"}
+        self.state.upsert_entry(
+            {
+                "path": "/Shared/renamed",
+                "type": "folder",
+                "parent_path": "/Shared",
+                "remote_drivewsid": "folder-old",
+                "remote_docwsid": "doc-old",
+                "remote_etag": "etag-old",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-old",
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/Shared/original",
+            }
+        )
+        entry = self.state.get_entry("/Shared/renamed")
+        parent_node = Mock()
+        parent_node.data = {"drivewsid": "shared-root", "shareID": shareid}
+        old_node = Mock()
+        old_node.data = {"drivewsid": "folder-old", "shareID": shareid, "item_id": "item-old"}
+        child = Mock()
+        old_node.get_children.return_value = [child]
+        new_node = Mock()
+        new_node.data = {
+            "type": "FOLDER",
+            "drivewsid": "folder-new",
+            "docwsid": "doc-new",
+            "etag": "etag-new",
+            "zone": "zone-1",
+            "shareID": shareid,
+            "item_id": "item-new",
+            "name": "renamed",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        self.engine._node_from_entry = Mock(return_value=old_node)
+        self.engine._create_remote_directory = Mock(return_value=new_node)
+        self.engine._move_remote_nodes = Mock()
+        self.engine._delete_remote_node = Mock()
+
+        self.engine._sync_shared_directory(entry, parent_node)
+
+        self.engine._move_remote_nodes.assert_called_once_with([child], new_node)
+        self.engine._delete_remote_node.assert_called_once_with(old_node)
+        updated = self.state.get_entry("/Shared/renamed")
+        self.assertEqual(updated["remote_drivewsid"], "folder-new")
+        self.assertEqual(updated["remote_itemid"], "item-new")
+        self.assertEqual(updated["synced_path"], "/Shared/renamed")
 
     def test_reconcile_child_meta_falls_back_to_remote_snapshot_for_shared_parent(self):
         shareid = {"share-zone": "abc"}
