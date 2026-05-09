@@ -1025,7 +1025,7 @@ class ICloudSyncEngine:
                     entry.get("size"),
                 )
                 node = self._node_from_entry(entry)
-                with closing(node.open(stream=True)) as response:
+                with closing(self._open_remote_file(node, entry, path, stream=True)) as response:
                     self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
@@ -1663,6 +1663,33 @@ class ICloudSyncEngine:
         )
         self.api.drive._raise_if_error(request)
         return request.json()
+
+    def _download_shared_file(self, node, **kwargs):
+        item_id = node.data.get("item_id")
+        if not item_id:
+            raise RuntimeError(f"Missing shared item id for {node.name}")
+        request = self.api.drive.session.get(
+            f"{self.api.drive._document_root}/v1/item/{item_id}",
+            params=self.api.drive.params,
+        )
+        self.api.drive._raise_if_error(request)
+        item_info = request.json().get("item_info", {})
+        url = item_info.get("urls", {}).get("url_download")
+        if not url:
+            raise KeyError(f"Shared download URL missing for {node.name}")
+        return self.api.drive.session.get(url, params=self.api.drive.params, **kwargs)
+
+    def _open_remote_file(self, node, entry, path, **kwargs):
+        if entry.get("remote_shareid"):
+            try:
+                return self._download_shared_file(node, **kwargs)
+            except Exception as exc:
+                self.logger.info(
+                    "Shared item download failed for %s; falling back to generic open: %s",
+                    path,
+                    exc,
+                )
+        return node.open(**kwargs)
 
     def _shared_item_id(self, node):
         item_id = node.data.get("item_id")
@@ -2362,7 +2389,21 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     remote_refresh_interval_seconds = int(config.get("remote_refresh_interval_seconds", 300))
     warmup_workers = int(config.get("warmup_workers", 1))
 
-    fs.init_icloud(username, password, cache_dir, cookie_dir)
+    try:
+        fs.init_icloud(username, password, cache_dir, cookie_dir)
+    except (
+        PyiCloudFailedLoginException,
+        PyiCloud2FARequiredException,
+        PyiCloud2SARequiredException,
+        PyiCloudAuthRequiredException,
+    ):
+        logger.error("Service stopping due to auth failure. Run './icloudctl auth' then './icloudctl start'.")
+        sys.exit(2)
+    except RuntimeError as exc:
+        if any(kw in str(exc) for kw in ("2FA required", "2SA required", "authentication")):
+            logger.error("Service stopping due to auth failure. Run './icloudctl auth' then './icloudctl start'.")
+            sys.exit(2)
+        raise
     fs.init_local_cache(
         cache_dir,
         warmup_mode,

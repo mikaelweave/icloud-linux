@@ -114,6 +114,7 @@ ExecStop=-/usr/bin/fusermount -uz $mount_dir
 ExecStart=$REPO_DIR/.venv/bin/python $REPO_DIR/driver.py -f -c $CONFIG_FILE $mount_dir
 Restart=on-failure
 RestartSec=15
+RestartPreventExitStatus=2
 TimeoutStopSec=10
 KillMode=control-group
 ExecStopPost=-/usr/bin/fusermount -uz $mount_dir

@@ -533,6 +533,62 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"chunked download")
         response.close.assert_called_once()
 
+    def test_ensure_local_file_downloads_shared_file_via_item_endpoint(self):
+        shareid = {"share-zone": "abc"}
+        self.state.upsert_entry(
+            {
+                "path": "/Shared/a.txt",
+                "type": "file",
+                "parent_path": "/Shared",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-shared",
+                "remote_zone": "zone-1",
+                "remote_shareid": shareid,
+                "remote_itemid": "item-shared",
+                "size": 13,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/Shared/a.txt",
+            }
+        )
+        self.mirror.ensure_dir("/Shared")
+        meta_response = Mock()
+        meta_response.json.return_value = {
+            "item_info": {
+                "urls": {
+                    "url_download": "https://download.example/shared-a.txt",
+                }
+            }
+        }
+        response = Mock()
+        response.raw = NoUnboundedReadStream(b"shared content")
+        response.close = Mock()
+        node = Mock()
+        node.name = "a.txt"
+        node.data = {
+            "drivewsid": "file-1",
+            "docwsid": "doc-shared",
+            "zone": "zone-1",
+            "shareID": shareid,
+            "item_id": "item-shared",
+        }
+        self.engine._node_from_entry = Mock(return_value=node)
+        self.engine.api.drive.session.get.side_effect = [meta_response, response]
+
+        self.engine.ensure_local_file("/Shared/a.txt")
+
+        self.assertEqual(self.mirror.read("/Shared/a.txt", 100, 0), b"shared content")
+        refreshed = self.state.get_entry("/Shared/a.txt")
+        self.assertTrue(refreshed["hydrated"])
+        first_call = self.engine.api.drive.session.get.call_args_list[0]
+        self.assertTrue(first_call.args[0].endswith("/v1/item/item-shared"))
+        second_call = self.engine.api.drive.session.get.call_args_list[1]
+        self.assertEqual(second_call.args[0], "https://download.example/shared-a.txt")
+        node.open.assert_not_called()
+        response.close.assert_called_once()
+
     def test_sync_file_uploads_stream_without_buffering_entire_file(self):
         self.mirror.create_file("/docs/a.txt")
         self.mirror.write("/docs/a.txt", b"hello world", 0)

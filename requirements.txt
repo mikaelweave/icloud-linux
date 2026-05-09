@@ -1,4 +1,7 @@
-fuse-python
-pyyaml
-pyicloud
-jsonpickle
+fuse-python==1.0.9
+pyyaml==6.0.3
+# 2.5.0 with manual patch from PR #233 (flowid fallback in hsa2_bridge.py).
+# Apple changed bridge push payload from sessionUUID to flowid; patch applied to venv.
+# Remove comment and re-pip-install once PR #233 merges into a release.
+pyicloud==2.5.0
+jsonpickle==4.1.1
