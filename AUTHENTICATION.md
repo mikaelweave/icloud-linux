@@ -32,7 +32,7 @@ The service is configured with `RestartPreventExitStatus=2` so it will enter a
 permanent `failed` state on auth errors rather than crash-looping. This prevents
 hammering Apple's auth endpoint and triggering rate-limits or account lockouts.
 
-## pyicloud 2.5.0 bridge patch (PR #233)
+## pyicloud 2.5.0 bridge compatibility patch (PR #233)
 
 **Background:** pyicloud 2.5.0 introduced the WebSocket bridge described above, but
 Apple subsequently changed their bridge push payload format — the `sessionUUID` field
@@ -46,9 +46,12 @@ received the "Are you trying to sign in?" notification.
 - The background service crash-loops with "Invalid email/password combination" or
   "2FA required, no interactive terminal" at high restart counts
 
-**Fix:** `pyicloud/hsa2_bridge.py` is patched (in the venv) to accept `flowid` as a
-fallback when `sessionUUID` is absent, based on the approach in
-[timlaing/pyicloud PR #233](https://github.com/timlaing/pyicloud/pull/233).
+**Fix:** `./icloudctl init` and `./icloudctl auth` run
+`scripts/patch_pyicloud_hsa2_bridge.py` after dependency installation. The
+helper patches the installed `pyicloud/hsa2_bridge.py` inside this project's
+virtualenv to accept `flowid` as a fallback when `sessionUUID` is absent, based
+on the approach in [timlaing/pyicloud PR #233](https://github.com/timlaing/pyicloud/pull/233).
+It is idempotent, so it is safe for setup commands to run repeatedly.
 
 The patch makes `_BridgePushPayloadModel` accept both fields:
 
@@ -63,13 +66,14 @@ And resolves whichever is present:
 resolved_session_uuid = validated.session_uuid or validated.flow_id
 ```
 
-The mismatch check between the locally generated session UUID and the payload UUID is
-also removed, because with `flowid` Apple generates the identifier rather than echoing
-back the client's value.
+The patch also updates the payload validator to allow either identifier,
+resolves whichever field Apple sends before building `BridgePushPayload`, and
+removes the bridge mismatch checks that compare Apple's generated `flowid`
+against pyicloud's locally generated `sessionUUID`.
 
 **When PR #233 merges into a pyicloud release**, update `requirements.txt` to the new
-version, remove the comment, and re-run `pip install -r requirements.txt` inside the
-venv. The venv patch will then be superseded by the official release.
+version and remove the compatibility patch invocation from `icloudctl`. The
+setup-time patch will then be superseded by the official release.
 
 ## Service reliability
 

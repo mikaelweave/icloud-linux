@@ -156,6 +156,7 @@ class SyncState:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.closed = False
         self._init_db()
 
     def _init_db(self):
@@ -210,6 +211,13 @@ class SyncState:
                     "ALTER TABLE entries ADD COLUMN remote_unified_token TEXT"
                 )
             self.conn.commit()
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.conn.close()
+            self.closed = True
 
     def upsert_entry(self, entry):
         payload = {
@@ -1905,6 +1913,8 @@ class ICloudFS(Fuse):
     def shutdown(self):
         if self.sync_engine is not None:
             self.sync_engine.shutdown()
+        if self.state is not None:
+            self.state.close()
 
     def init_icloud(self, username, password, cache_dir, cookie_dir=None):
         self.username = username

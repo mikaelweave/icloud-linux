@@ -114,6 +114,10 @@ So this project uses:
 - `./icloudctl auth` for the interactive one-time Apple login and 2FA flow
 - a generated user service that reuses the saved session cookies in the background
 
+During 2FA, `./icloudctl auth` sends the trusted-device push first. Tap
+**Allow** on your Apple device, then enter the 6-digit code shown on that
+device.
+
 If Apple expires your session, run:
 
 ```bash
@@ -298,4 +302,4 @@ Do **not** treat `~/.cache/icloud-linux/mirror` as a writable multi-user share: 
 
 - Warmup downloads are intentionally conservative because iCloud file downloads are sensitive to aggressive parallelism.
 - The generated systemd unit is created by `./icloudctl`; the repo does not rely on checked-in service files anymore.
-- This project currently targets a user-level systemd service, not a system-wide root service.
+- Workstation installs use a user-level systemd service. Root/container installs can use the documented `*-system` commands.

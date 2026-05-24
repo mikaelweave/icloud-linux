@@ -7,7 +7,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import fuse
 
@@ -38,6 +38,7 @@ class DriverStateTests(unittest.TestCase):
         self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
 
     def tearDown(self):
+        self.state.close()
         shutil.rmtree(self.root)
 
     def test_mirror_read_write_truncate(self):
@@ -309,6 +310,7 @@ class DriverStateTests(unittest.TestCase):
         self.assertIn("remote_shareid", column_names)
         self.assertIn("remote_itemid", column_names)
         self.assertIn("remote_unified_token", column_names)
+        migrated.close()
 
 
 class SyncEngineStartupTests(unittest.TestCase):
@@ -330,6 +332,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._reconcile_persistent_cache = Mock()
 
     def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
         shutil.rmtree(self.root)
 
     def test_start_uses_persistent_cache_without_initial_scan(self):
@@ -1152,6 +1156,54 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._schedule_download.assert_called_once_with("/docs/a.txt")
 
 
+class ICloudAuthBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-auth-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_init_icloud_rejects_noninteractive_2fa(self):
+        fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
+        api = Mock()
+        api.requires_2fa = True
+        api.requires_2sa = False
+
+        with (
+            patch("driver.PyiCloudService", return_value=api),
+            patch("driver.sys.stdin.isatty", return_value=False),
+        ):
+            with self.assertRaises(RuntimeError):
+                fs.init_icloud("user@example.com", "password", self.root)
+
+    def test_init_icloud_trusts_successful_interactive_2fa(self):
+        class FakeApi:
+            requires_2fa = True
+            requires_2sa = False
+            is_trusted_session = False
+
+            def validate_2fa_code(self, code):
+                self.validated_code = code
+                self.requires_2fa = False
+                return True
+
+            def trust_session(self):
+                self.is_trusted_session = True
+
+        fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
+        api = FakeApi()
+
+        with (
+            patch("driver.PyiCloudService", return_value=api),
+            patch("driver.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="123456"),
+        ):
+            fs.init_icloud("user@example.com", "password", self.root)
+
+        self.assertEqual(api.validated_code, "123456")
+        self.assertTrue(api.is_trusted_session)
+
+
 class FuseOptionTests(unittest.TestCase):
     def test_apply_fuse_options_adds_enabled_options(self):
         fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
@@ -1187,6 +1239,7 @@ class PermissionConfigTests(unittest.TestCase):
         self.fs.state = self.state
 
     def tearDown(self):
+        self.state.close()
         shutil.rmtree(self.root)
 
     def test_apply_permissions_config_controls_presented_attrs(self):

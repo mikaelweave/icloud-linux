@@ -89,6 +89,7 @@ ensure_venv() {
     python3 -m venv "$REPO_DIR/.venv"
   fi
   "$REPO_DIR/.venv/bin/pip" install -q -r "$REPO_DIR/requirements.txt"
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/scripts/patch_pyicloud_hsa2_bridge.py"
 }
 
 create_config_if_missing() {
