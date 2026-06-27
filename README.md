@@ -213,6 +213,35 @@ icloudctl hydrate       # download file contents for all eligible paths
 # now copy from mirror: ~/.cache/icloud-linux/mirror/Downloads/
 ```
 
+## Shared Folders And Presented Permissions
+
+This fork adds two capabilities on top of upstream, aimed at containerized access
+(for example an Incus / OpenClaw container that reads the mount or the on-disk
+mirror directly):
+
+**iCloud shared folders are read/write.** Folders shared with you in iCloud Drive
+are mounted like any other path, and local edits (create, write, rename, move,
+delete) are pushed back through iCloud's share-aware Drive endpoints. The share
+identity is persisted in the sync-state database so shared files survive restarts
+and continue to upload/download correctly.
+
+**Presented ownership and permissions are configurable.** Add a `permissions:`
+block to your config to control the uid/gid and modes the mount presents. The
+on-disk mirror is chmod'd to match, so a container reading the mirror directory
+directly sees consistent ownership and permissions:
+
+```yaml
+permissions:
+  file_mode: "0644"
+  dir_mode: "0755"
+  # uid: 1000   # defaults to the process uid
+  # gid: 1000   # defaults to the process gid
+```
+
+To let another user or container access the FUSE mount itself, set
+`fuse_options.allow_other: true`. On most hosts this also requires
+`user_allow_other` in `/etc/fuse.conf`.
+
 ## Copying Files to Another Location
 
 Once files are hydrated, copy from the local mirror rather than from the FUSE mount:

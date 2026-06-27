@@ -52,8 +52,19 @@ cookie_dir: "~/.config/icloud-linux/cookies"
 #                   constant polling is wasteful.
 auto_sync: true
 
+# Presented ownership and permissions for the mounted files. This is important
+# for containerized access (e.g. an Incus/OpenClaw container reading the mount):
+# files are presented with these modes and owned by the given uid/gid, and the
+# on-disk cache mirror is chmod'd to match so a container reading the mirror dir
+# directly sees consistent permissions.
+permissions:
+  file_mode: "0644"   # Mode presented for files (octal string)
+  dir_mode: "0755"    # Mode presented for directories (octal string)
+  # uid: 1000         # Defaults to the process uid if unset
+  # gid: 1000         # Defaults to the process gid if unset
+
 # FUSE options
 fuse_options:
-  allow_other: false  # Set to true to allow other users to access the mount
+  allow_other: false  # Set to true to share the mount with other users/containers; requires "user_allow_other" in /etc/fuse.conf on many hosts
   ro: false           # Set to true for read-only access
   nonempty: true      # Allow mounting over a non-empty directory

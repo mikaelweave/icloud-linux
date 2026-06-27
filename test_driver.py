@@ -477,6 +477,7 @@ class SyncEngineStartupTests(unittest.TestCase):
             upload_state["prefix"] = stream.read(5)
 
         parent_node = Mock()
+        parent_node.data = {}
         parent_node.upload.side_effect = capture_upload
         self.engine._ensure_remote_parent = Mock(return_value=parent_node)
         self.engine.ensure_local_file = Mock()
