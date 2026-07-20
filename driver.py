@@ -468,12 +468,38 @@ class SyncState:
             )
             self.conn.commit()
 
-    def rename_tree(self, oldpath, newpath, root_dirty=True, update_synced=False):
+    def rename_tree(
+        self,
+        oldpath,
+        newpath,
+        root_dirty=True,
+        update_synced=False,
+        replace_entry=None,
+    ):
         entries = self._fetch_subtree(oldpath)
         if not entries:
             return
         prefix = oldpath.rstrip("/") + "/"
         with self.lock:
+            if replace_entry is not None:
+                destination_prefix = newpath.rstrip("/") + "/"
+                self.conn.execute(
+                    "DELETE FROM entries WHERE path = ? OR path LIKE ?",
+                    (newpath, destination_prefix + "%"),
+                )
+                self.conn.execute(
+                    """
+                    DELETE FROM pending_ops
+                    WHERE path = ? OR path LIKE ?
+                       OR target_path = ? OR target_path LIKE ?
+                    """,
+                    (
+                        newpath,
+                        destination_prefix + "%",
+                        newpath,
+                        destination_prefix + "%",
+                    ),
+                )
             for entry in entries:
                 current = entry["path"]
                 suffix = "" if current == oldpath else current[len(prefix) :]
@@ -505,6 +531,34 @@ class SyncState:
                         newpath.rstrip("/") + "/",
                         len(prefix) + 1,
                         current,
+                    ),
+                )
+            if replace_entry is not None and replace_entry.get("remote_drivewsid"):
+                self.conn.execute(
+                    """
+                    UPDATE entries
+                    SET remote_drivewsid = ?,
+                        remote_docwsid = ?,
+                        remote_etag = ?,
+                        remote_zone = ?,
+                        remote_shareid = ?,
+                        remote_itemid = ?,
+                        remote_unified_token = ?,
+                        dirty = 1,
+                        tombstone = 0,
+                        synced_path = ?
+                    WHERE path = ?
+                    """,
+                    (
+                        replace_entry.get("remote_drivewsid"),
+                        replace_entry.get("remote_docwsid"),
+                        replace_entry.get("remote_etag"),
+                        replace_entry.get("remote_zone"),
+                        self._encode_shareid(replace_entry.get("remote_shareid")),
+                        replace_entry.get("remote_itemid"),
+                        replace_entry.get("remote_unified_token"),
+                        newpath,
+                        newpath,
                     ),
                 )
             self.conn.execute(
@@ -2422,16 +2476,26 @@ class ICloudFS(Fuse):
             return -errno.ENOENT
 
         try:
-            if self.mirror.exists(newpath):
-                self.mirror.remove_tree(newpath)
-                existing = self.state.get_entry(newpath)
-                if existing:
-                    if existing["remote_drivewsid"]:
-                        self.state.mark_tombstone(newpath)
-                    else:
-                        self.state.remove_subtree(newpath)
+            existing = self.state.get_entry(newpath)
+            if (
+                existing
+                and existing.get("remote_drivewsid")
+                and entry.get("remote_drivewsid")
+                and existing["remote_drivewsid"] != entry["remote_drivewsid"]
+            ):
+                self.logger.error(
+                    "Refusing to replace remotely synced path %s with different remotely synced path %s",
+                    newpath,
+                    oldpath,
+                )
+                return -errno.EEXIST
             self.mirror.rename_path(oldpath, newpath)
-            self.state.rename_tree(oldpath, newpath, root_dirty=True)
+            self.state.rename_tree(
+                oldpath,
+                newpath,
+                root_dirty=True,
+                replace_entry=existing,
+            )
             self.state.queue_op("rename", oldpath, newpath)
             self._log_file_op("rename", oldpath, target_path=newpath)
             return 0
