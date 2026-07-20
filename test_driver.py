@@ -606,6 +606,16 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             "remote-/allowed/destination.md",
         )
 
+    def test_rename_type_collision_returns_native_errno(self):
+        self.assertEqual(self.fs.create("/allowed/source.md", 0o644), 0)
+        self.assertEqual(self.fs.mkdir("/allowed/destination", 0o755), 0)
+
+        result = self.fs.rename("/allowed/source.md", "/allowed/destination")
+
+        self.assertEqual(result, -errno.EISDIR)
+        self.assertTrue(self.mirror.exists("/allowed/source.md"))
+        self.assertTrue(self.mirror.is_dir("/allowed/destination"))
+
     def test_excluded_and_out_of_scope_mutations_are_rejected_without_queueing(self):
         self._add_entry("/allowed/source.txt")
         self._add_entry("/allowed/excluded/file.txt")

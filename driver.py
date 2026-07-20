@@ -2499,6 +2499,11 @@ class ICloudFS(Fuse):
             self.state.queue_op("rename", oldpath, newpath)
             self._log_file_op("rename", oldpath, target_path=newpath)
             return 0
+        except OSError as exc:
+            if exc.errno:
+                return -exc.errno
+            self.logger.error("Error renaming %s to %s: %s", oldpath, newpath, exc)
+            return -errno.EIO
         except Exception as exc:
             self.logger.error("Error renaming %s to %s: %s", oldpath, newpath, exc)
             return -errno.EIO
