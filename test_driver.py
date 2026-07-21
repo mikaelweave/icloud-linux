@@ -568,6 +568,54 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         self.assertEqual(self.fs.rmdir("/allowed/newdir"), 0)
         self.assertGreater(self._pending_op_count(), 0)
 
+    def test_atomic_file_replacement_preserves_destination_remote_identity(self):
+        self._add_entry("/allowed/note.md", content=b"old")
+        self.assertEqual(self.fs.create("/allowed/note.md.tmp", 0o644), 0)
+        self.assertEqual(self.fs.write("/allowed/note.md.tmp", b"new", 0), 3)
+
+        result = self.fs.rename("/allowed/note.md.tmp", "/allowed/note.md")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.mirror.read("/allowed/note.md", 100, 0), b"new")
+        self.assertFalse(self.mirror.exists("/allowed/note.md.tmp"))
+        self.assertIsNone(self.state.get_entry("/allowed/note.md.tmp"))
+        entry = self.state.get_entry("/allowed/note.md")
+        self.assertEqual(entry["remote_drivewsid"], "remote-/allowed/note.md")
+        self.assertEqual(entry["synced_path"], "/allowed/note.md")
+        self.assertEqual(entry["dirty"], 1)
+        self.assertEqual(entry["tombstone"], 0)
+
+    def test_replacing_remote_file_with_different_remote_file_is_rejected(self):
+        self._add_entry("/allowed/source.md", content=b"source")
+        self._add_entry("/allowed/destination.md", content=b"destination")
+
+        result = self.fs.rename("/allowed/source.md", "/allowed/destination.md")
+
+        self.assertEqual(result, -errno.EEXIST)
+        self.assertEqual(self.mirror.read("/allowed/source.md", 100, 0), b"source")
+        self.assertEqual(
+            self.mirror.read("/allowed/destination.md", 100, 0),
+            b"destination",
+        )
+        self.assertEqual(
+            self.state.get_entry("/allowed/source.md")["remote_drivewsid"],
+            "remote-/allowed/source.md",
+        )
+        self.assertEqual(
+            self.state.get_entry("/allowed/destination.md")["remote_drivewsid"],
+            "remote-/allowed/destination.md",
+        )
+
+    def test_rename_type_collision_returns_native_errno(self):
+        self.assertEqual(self.fs.create("/allowed/source.md", 0o644), 0)
+        self.assertEqual(self.fs.mkdir("/allowed/destination", 0o755), 0)
+
+        result = self.fs.rename("/allowed/source.md", "/allowed/destination")
+
+        self.assertEqual(result, -errno.EISDIR)
+        self.assertTrue(self.mirror.exists("/allowed/source.md"))
+        self.assertTrue(self.mirror.is_dir("/allowed/destination"))
+
     def test_excluded_and_out_of_scope_mutations_are_rejected_without_queueing(self):
         self._add_entry("/allowed/source.txt")
         self._add_entry("/allowed/excluded/file.txt")
