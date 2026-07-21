@@ -7,8 +7,9 @@ import stat
 import tempfile
 import unittest
 from unittest.mock import Mock
+from requests.models import RequestEncodingMixin
 
-from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
+from driver import ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -49,6 +50,18 @@ class DriverStateTests(unittest.TestCase):
         self.mirror.write_atomic_stream("/docs/a.txt", stream)
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
+
+    def test_named_file_stream_is_encoded_as_file_content(self):
+        stream = NamedFileStream(io.BytesIO(b"content"), "note.md")
+
+        body, content_type = RequestEncodingMixin._encode_files(
+            {stream.name: stream},
+            {},
+        )
+
+        self.assertIn(b"content", body)
+        self.assertIn(b'filename="note.md"', body)
+        self.assertTrue(content_type.startswith("multipart/form-data"))
 
     def test_rename_tree_preserves_old_synced_paths_for_local_rename(self):
         self.state.upsert_entry(

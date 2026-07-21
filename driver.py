@@ -177,6 +177,9 @@ class NamedFileStream:
     def __getattr__(self, attr):
         return getattr(self._handle, attr)
 
+    def read(self, size=-1):
+        return self._handle.read(size)
+
 
 class SyncState:
     def __init__(self, db_path):
