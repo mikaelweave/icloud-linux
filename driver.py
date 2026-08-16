@@ -76,6 +76,10 @@ class MissingMirrorFile(Exception):
     pass
 
 
+class HydrationFailed(Exception):
+    pass
+
+
 class SyncPassContext:
     def __init__(self):
         self.failed_remote_parents = set()
@@ -380,6 +384,7 @@ class SyncState:
                     """
                 )
             self.clear_sync_backoff()
+            self.clear_hydrate_backoff()
             self.conn.commit()
 
     def close(self):
@@ -478,9 +483,13 @@ class SyncState:
             rows = self.conn.execute(
                 """
                 SELECT path FROM entries
-                WHERE type = 'file' AND tombstone = 0 AND hydrated = 0
+                WHERE type = 'file'
+                    AND tombstone = 0
+                    AND hydrated = 0
+                    AND hydrate_attempt_count < ?
                 ORDER BY path
-                """
+                """,
+                (MAX_SYNC_ATTEMPTS,),
             ).fetchall()
         return [row["path"] for row in rows]
 
@@ -571,12 +580,82 @@ class SyncState:
             )
             self.conn.commit()
 
+    def record_hydrate_failure(self, path, error, classification, max_attempts):
+        error_text = str(error)[:500]
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT hydrate_attempt_count FROM entries WHERE path = ?",
+                (path,),
+            ).fetchone()
+            if row is None:
+                return 0, False
+            attempt = int(row["hydrate_attempt_count"]) + 1
+            quarantined = (
+                classification == SYNC_FAILURE_TERMINAL
+                or attempt >= max_attempts
+            )
+            if quarantined:
+                attempt = max(attempt, max_attempts)
+            next_attempt_at = (
+                None
+                if quarantined
+                else int(time.time()) + _retry_delay_for_attempt(attempt)
+            )
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET hydrate_attempt_count = ?,
+                    hydrate_next_attempt_at = ?,
+                    hydrate_last_error = ?
+                WHERE path = ?
+                """,
+                (attempt, next_attempt_at, error_text, path),
+            )
+            self.conn.commit()
+        return attempt, quarantined
+
+    def clear_hydrate_failure(self, path):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET hydrate_attempt_count = 0,
+                    hydrate_next_attempt_at = NULL,
+                    hydrate_last_error = NULL
+                WHERE path = ?
+                """,
+                (path,),
+            )
+            self.conn.commit()
+
+    def defer_hydrate(self, path, delay):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET hydrate_next_attempt_at = ?
+                WHERE path = ?
+                """,
+                (int(time.time()) + int(delay), path),
+            )
+            self.conn.commit()
+
+    def clear_hydrate_backoff(self):
+        with self.lock:
+            self.conn.execute(
+                "UPDATE entries SET hydrate_next_attempt_at = NULL"
+            )
+            self.conn.commit()
+
     def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
         with self.lock:
             self.conn.execute(
                 """
                 UPDATE entries
                 SET hydrated = 1,
+                    hydrate_attempt_count = 0,
+                    hydrate_next_attempt_at = NULL,
+                    hydrate_last_error = NULL,
                     local_sha256 = COALESCE(?, local_sha256),
                     size = COALESCE(?, size),
                     mtime = COALESCE(?, mtime)
@@ -1106,7 +1185,6 @@ class ICloudSyncEngine:
         self.path_locks_lock = threading.Lock()
         self.scheduled_downloads = set()
         self.downloads_lock = threading.Lock()
-        self.download_retry_attempts = {}
         self.download_retry_timers = {}
         self.sync_pass_lock = threading.Lock()
         self.sync_auth_cooldown_until = 0
@@ -1264,6 +1342,10 @@ class ICloudSyncEngine:
                 return
             if entry["hydrated"] and self.mirror.exists(path):
                 return
+            if entry["hydrate_attempt_count"] >= MAX_SYNC_ATTEMPTS:
+                raise HydrationFailed(
+                    "hydration retry budget exhausted for {}".format(path)
+                )
             if not entry["remote_drivewsid"]:
                 self._log_sync("hydrate-local", level=logging.DEBUG, path=path)
                 if not self.mirror.exists(path):
@@ -1529,6 +1611,9 @@ class ICloudSyncEngine:
             return
         if self.stop_event.is_set() or self.is_shutdown:
             return
+        entry = self.state.get_entry(path)
+        if entry and entry["hydrate_attempt_count"] >= MAX_SYNC_ATTEMPTS:
+            return
 
         with self.downloads_lock:
             if path in self.scheduled_downloads:
@@ -1572,15 +1657,33 @@ class ICloudSyncEngine:
     def _retry_delay_for_attempt(self, attempt):
         return _retry_delay_for_attempt(attempt)
 
-    def _is_auth_error(self, exc):
-        return classify_sync_failure(exc, None) == SYNC_FAILURE_AUTH
+    def _record_hydrate_failure(self, path, exc):
+        classification = classify_sync_failure(exc, "download")
+        if classification == SYNC_FAILURE_AUTH:
+            self.state.defer_hydrate(
+                path,
+                self._retry_delay_for_attempt(1),
+            )
+            return classification, 0, False
+        attempt, exhausted = self.state.record_hydrate_failure(
+            path,
+            exc,
+            classification,
+            MAX_SYNC_ATTEMPTS,
+        )
+        return classification, attempt, exhausted
 
     def _download_job(self, path):
         retry_delay = None
         try:
+            entry = self.state.get_entry(path)
+            if entry and entry["hydrate_attempt_count"] >= MAX_SYNC_ATTEMPTS:
+                self.logger.error(
+                    "Warmup download failed for %s; hydration retry budget exhausted",
+                    path,
+                )
+                return
             self.ensure_local_file(path)
-            with self.downloads_lock:
-                self.download_retry_attempts.pop(path, None)
             self._log_sync("download-complete", level=logging.INFO, path=path)
             with self.hydration_progress_lock:
                 self.hydration_completed += 1
@@ -1593,24 +1696,31 @@ class ICloudSyncEngine:
                     total,
                 )
         except Exception as exc:
-            if self._is_auth_error(exc):
+            classification, attempt, exhausted = self._record_hydrate_failure(
+                path,
+                exc,
+            )
+            if classification == SYNC_FAILURE_AUTH:
                 self.logger.error(
                     "Warmup download blocked by expired iCloud authentication for %s: %s. "
                     "Run './icloudctl auth' and then './icloudctl restart'.",
                     path,
                     exc,
                 )
-                with self.downloads_lock:
-                    self.download_retry_attempts.pop(path, None)
                 return
-            with self.downloads_lock:
-                attempt = self.download_retry_attempts.get(path, 0) + 1
-                self.download_retry_attempts[path] = attempt
-            retry_delay = self._retry_delay_for_attempt(attempt)
+            if exhausted:
+                self.logger.error(
+                    "Warmup download failed for %s (attempt %s): %s; quarantined",
+                    path,
+                    attempt,
+                    exc,
+                )
+                return
+            retry_delay = self._retry_delay_for_attempt(attempt or 1)
             self.logger.error(
                 "Warmup download failed for %s (attempt %s): %s; retrying in %ss",
                 path,
-                attempt,
+                attempt or 1,
                 exc,
                 retry_delay,
             )
@@ -1849,7 +1959,47 @@ class ICloudSyncEngine:
                     "resolution is required."
                 )
 
-            self.ensure_local_file(entry["path"])
+            try:
+                self.ensure_local_file(entry["path"])
+            except HydrationFailed as exc:
+                self.logger.error(
+                    "Sync file %s blocked by failed hydration: %s",
+                    entry["path"],
+                    exc,
+                )
+                return
+            except Exception as exc:
+                if entry["hydrated"]:
+                    raise
+                classification, attempt, exhausted = self._record_hydrate_failure(
+                    entry["path"],
+                    exc,
+                )
+                if classification == SYNC_FAILURE_AUTH:
+                    self.sync_auth_cooldown_until = (
+                        time.time() + AUTH_SYNC_COOLDOWN_SECONDS
+                    )
+                    if is_sync_pass:
+                        raise SyncAuthenticationBlocked()
+                    return
+                if exhausted:
+                    self.logger.error(
+                        "Sync file %s blocked by failed hydration (attempt %s): %s",
+                        entry["path"],
+                        attempt,
+                        exc,
+                    )
+                    return
+                self._schedule_download_with_delay(
+                    entry["path"],
+                    self._retry_delay_for_attempt(attempt),
+                )
+                self.logger.error(
+                    "Sync file %s deferred while hydration retries: %s",
+                    entry["path"],
+                    exc,
+                )
+                return
             is_shared = bool(entry.get("remote_shareid") or parent_node.data.get("shareID"))
 
             if (
@@ -2581,7 +2731,12 @@ class ICloudFS(Fuse):
             return -errno.ENOENT
 
         entry = self.state.get_entry(path)
-        if entry and entry["type"] == "file" and not entry["hydrated"] and not entry["dirty"]:
+        if (
+            entry
+            and entry["type"] == "file"
+            and not entry["hydrated"]
+            and entry["remote_drivewsid"]
+        ):
             if not self._is_authenticated() or self.sync_engine is None:
                 # No session: serve what we have locally; remote files return EIO
                 if not self.mirror.exists(path):
@@ -2630,7 +2785,7 @@ class ICloudFS(Fuse):
             return -errno.ENOENT
 
         try:
-            if not entry["hydrated"] and not entry["dirty"]:
+            if not entry["hydrated"] and entry["remote_drivewsid"]:
                 if self.sync_engine is None:
                     # No session — cannot hydrate; if placeholder exists it has no data
                     self.logger.warning(

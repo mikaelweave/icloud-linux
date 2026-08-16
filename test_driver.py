@@ -1360,5 +1360,275 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             engine.shutdown()
 
 
+class DurableHydrationQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.logger = Mock()
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            self.logger,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def _add_unhydrated_entry(self, path, dirty=False):
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": "remote-" + path,
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": dirty,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+
+    def test_transient_download_failure_persists_hydration_backoff(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.engine.ensure_local_file = Mock(side_effect=Timeout("timed out"))
+        self.engine._schedule_download_with_delay = Mock()
+        self.engine.scheduled_downloads.add("/queued.txt")
+
+        self.engine._download_job("/queued.txt")
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], 1)
+        self.assertGreater(entry["hydrate_next_attempt_at"], int(time.time()))
+        self.assertEqual(entry["hydrate_last_error"], "timed out")
+
+    def test_restart_preserves_hydration_attempts_and_clears_backoff(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.state.record_hydrate_failure(
+            "/queued.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+        self.state.close()
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], 1)
+        self.assertEqual(entry["hydrate_last_error"], "temporary outage")
+        self.assertIsNone(entry["hydrate_next_attempt_at"])
+
+    def test_hydration_exhaustion_stops_retry_scheduling(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.engine.ensure_local_file = Mock(side_effect=Timeout("timed out"))
+        self.engine._schedule_download_with_delay = Mock()
+
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.engine.scheduled_downloads.add("/queued.txt")
+            self.engine._download_job("/queued.txt")
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], MAX_SYNC_ATTEMPTS)
+        self.assertIsNone(entry["hydrate_next_attempt_at"])
+        self.assertEqual(
+            self.engine._schedule_download_with_delay.call_count,
+            MAX_SYNC_ATTEMPTS - 1,
+        )
+
+    def test_successful_hydration_clears_hydration_retry_state(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.state.record_hydrate_failure(
+            "/queued.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+        response = Mock()
+        response.raw = io.BytesIO(b"downloaded")
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine._download_job("/queued.txt")
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], 0)
+        self.assertIsNone(entry["hydrate_next_attempt_at"])
+        self.assertIsNone(entry["hydrate_last_error"])
+
+    def test_download_auth_failure_does_not_consume_hydration_budget(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+        self.engine._schedule_download_with_delay = Mock()
+        self.engine.scheduled_downloads.add("/queued.txt")
+
+        self.engine._download_job("/queued.txt")
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], 0)
+        self.assertIsNotNone(entry["hydrate_next_attempt_at"])
+        self.engine._schedule_download_with_delay.assert_not_called()
+
+    def test_hydration_exhaustion_does_not_block_upload_sync(self):
+        self._add_unhydrated_entry("/queued.txt", dirty=True)
+        self._add_unhydrated_entry("/sibling.txt", dirty=True)
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_hydrate_failure(
+                "/queued.txt",
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        self.engine._sync_file = Mock()
+
+        self.engine.sync_dirty_entries()
+
+        self.assertEqual(
+            {call.args[0]["path"] for call in self.engine._sync_file.call_args_list},
+            {"/queued.txt", "/sibling.txt"},
+        )
+        self.assertEqual(self.state.get_entry("/queued.txt")["failed"], 0)
+
+    def test_hydration_exhaustion_does_not_consume_sync_budget(self):
+        self._add_unhydrated_entry("/queued.txt", dirty=True)
+        self.mirror.materialize_placeholder("/queued.txt", 10, 123)
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_hydrate_failure(
+                "/queued.txt",
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+
+        self.engine._sync_file(self.state.get_entry("/queued.txt"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertEqual(entry["failed"], 0)
+
+
+class HydrationFailureFUSETests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(self.api, self.mirror, self.state, Mock())
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.api = self.api
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = self.engine
+        self.fs.file_mode = 0o644
+        self.fs.dir_mode = 0o755
+        self.fs.mount_uid = os.getuid()
+        self.fs.mount_gid = os.getgid()
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def test_reading_hydration_exhausted_entry_returns_eio(self):
+        path = "/unavailable.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-unavailable",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.mirror.materialize_placeholder(path, 10, 123)
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_hydrate_failure(
+                path,
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+
+        self.assertEqual(self.fs.read(path, 10, 0), -errno.EIO)
+
+    def test_utime_dirty_unhydrated_entry_returns_eio_but_remains_visible(self):
+        path = "/unavailable.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-unavailable",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.mirror.materialize_placeholder(path, 10, 123)
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_hydrate_failure(
+                path,
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        self.fs._is_authenticated = Mock(return_value=True)
+        self.fs._mutation_allowed = Mock(return_value=True)
+
+        self.assertEqual(self.fs.utime(path, (123, 124)), 0)
+        self.assertTrue(self.state.get_entry(path)["dirty"])
+        self.assertEqual(self.fs.read(path, 10, 0), -errno.EIO)
+        self.assertEqual(self.fs.getattr(path).st_size, 10)
+        self.assertIn(
+            "unavailable.txt",
+            [entry.name for entry in self.fs.readdir("/", 0)],
+        )
+
+    def test_dirty_unhydrated_local_file_reads_local_content(self):
+        path = "/local.txt"
+        self.mirror.create_file(path)
+        self.mirror.write(path, b"local content", 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": False,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": None,
+            }
+        )
+        self.engine.ensure_local_file = Mock()
+
+        self.assertEqual(self.fs.read(path, 100, 0), b"local content")
+        self.engine.ensure_local_file.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
