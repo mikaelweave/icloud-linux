@@ -12,6 +12,8 @@ import yaml
 
 
 MISSING_PATH_LIMIT = 50
+MAX_SYNC_ATTEMPTS = 8
+ERROR_DISPLAY_LIMIT = 200
 
 
 def load_config(config_path):
@@ -113,6 +115,7 @@ def inspect_queue(db_path, mirror_root, now=None):
             "tombstone",
             "failed",
             "sync_attempt_count",
+            "sync_next_attempt_at",
             "sync_last_error",
         }
         if retry_columns <= columns:
@@ -120,7 +123,9 @@ def inspect_queue(db_path, mirror_root, now=None):
                 dict(row)
                 for row in conn.execute(
                     """
-                    SELECT path, failed, sync_last_error FROM entries
+                    SELECT path, sync_attempt_count, sync_next_attempt_at,
+                           sync_last_error
+                    FROM entries
                     WHERE (dirty = 1 OR tombstone = 1)
                       AND failed = 0
                       AND sync_attempt_count > 0
@@ -137,7 +142,7 @@ def inspect_queue(db_path, mirror_root, now=None):
                 dict(row)
                 for row in conn.execute(
                     """
-                    SELECT path, failed, sync_last_error FROM entries
+                    SELECT path, sync_attempt_count, sync_last_error FROM entries
                     WHERE failed = 1
                     ORDER BY path
                     """
@@ -145,6 +150,41 @@ def inspect_queue(db_path, mirror_root, now=None):
             ]
         else:
             report["quarantined_entries"] = None
+
+        hydrate_columns = {
+            "path",
+            "hydrate_attempt_count",
+            "hydrate_last_error",
+        }
+        if hydrate_columns <= columns:
+            report["hydrate_exhausted_entries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path, hydrate_attempt_count, hydrate_last_error
+                    FROM entries
+                    WHERE hydrate_attempt_count >= ?
+                    ORDER BY path
+                    """,
+                    (MAX_SYNC_ATTEMPTS,),
+                )
+            ]
+        else:
+            report["hydrate_exhausted_entries"] = None
+
+        if {"path", "tombstone"} <= columns:
+            report["pending_tombstones"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path FROM entries
+                    WHERE tombstone = 1
+                    ORDER BY path
+                    """
+                )
+            ]
+        else:
+            report["pending_tombstones"] = None
 
         if {"dirty", "hydrated"} <= columns:
             report["dirty_unhydrated"] = _count(
@@ -211,6 +251,36 @@ def _value_or_unavailable(value):
     return "unavailable" if value is None else str(value)
 
 
+def _truncate_error(error):
+    error = error or "no error recorded"
+    if len(error) <= ERROR_DISPLAY_LIMIT:
+        return error
+    return error[: ERROR_DISPLAY_LIMIT - 3] + "..."
+
+
+def format_due(timestamp, now=None):
+    if timestamp is None:
+        return "now"
+    now = time.time() if now is None else now
+    if timestamp <= now:
+        return "now"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def queue_summary(report):
+    if "schema_error" in report:
+        return f"Queue: unavailable ({report['schema_error']})"
+    pending = report.get("pending_retries")
+    quarantined = report.get("quarantined_entries")
+    hydrate_exhausted = report.get("hydrate_exhausted_entries")
+    if pending is None or quarantined is None or hydrate_exhausted is None:
+        return "Queue: unavailable (durable queue schema is incomplete)"
+    return (
+        f"Queue: {len(pending)} pending, {len(quarantined)} quarantined, "
+        f"{len(hydrate_exhausted)} hydrate-failed"
+    )
+
+
 def print_report(config_path, cache_dir, db_path, mirror_root, report):
     print("icloud-linux queue")
     print(f"  Config: {config_path}")
@@ -251,45 +321,83 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
             "  Pending without last_synced_at: "
             f"{report['pending_without_timestamp']}"
         )
-    pending_retries = report["pending_retries"]
-    if pending_retries is None:
-        print("  Pending retries: unavailable")
-    else:
-        print(f"  Pending retries: {len(pending_retries)}")
-        for entry in pending_retries:
-            error = entry["sync_last_error"] or "no error recorded"
-            print(f"    {entry['path']} (failed={entry['failed']}): {error}")
-    quarantined_entries = report["quarantined_entries"]
-    if quarantined_entries is None:
-        print("  Quarantined entries: unavailable")
-    else:
-        print(f"  Quarantined entries: {len(quarantined_entries)}")
-        for entry in quarantined_entries:
-            error = entry["sync_last_error"] or "no error recorded"
-            print(f"    {entry['path']} (failed={entry['failed']}): {error}")
     print()
+
+    pending_retries = report["pending_retries"]
+    if pending_retries:
+        print(f"Pending retries ({len(pending_retries)}):")
+        for entry in pending_retries:
+            print(
+                f"  {entry['path']} (attempt {entry['sync_attempt_count']}; "
+                f"due {format_due(entry['sync_next_attempt_at'])}): "
+                f"{_truncate_error(entry['sync_last_error'])}"
+            )
+        print()
+
+    quarantined_entries = report["quarantined_entries"]
+    if quarantined_entries:
+        print(
+            "Sync quarantine — manual action required "
+            f"({len(quarantined_entries)}):"
+        )
+        for entry in quarantined_entries:
+            print(
+                f"  {entry['path']} (attempt {entry['sync_attempt_count']}): "
+                f"{_truncate_error(entry['sync_last_error'])}"
+            )
+            print(
+                "    Remedy: resolve the error, then run: "
+                f"./icloudctl retry '{entry['path']}'"
+            )
+        print()
+
+    hydrate_exhausted = report["hydrate_exhausted_entries"]
+    if hydrate_exhausted:
+        print(f"Hydration exhausted ({len(hydrate_exhausted)}):")
+        for entry in hydrate_exhausted:
+            print(
+                f"  {entry['path']} (attempt {entry['hydrate_attempt_count']}): "
+                f"{_truncate_error(entry['hydrate_last_error'])}"
+            )
+        print()
+
+    pending_tombstones = report["pending_tombstones"]
+    if pending_tombstones:
+        print(f"Tombstones awaiting remote deletion ({len(pending_tombstones)}):")
+        for entry in pending_tombstones:
+            print(f"  {entry['path']}")
+        print()
 
     missing = report["missing_mirror_files"]
     if missing is None:
         print("At-risk dirty files with missing mirror files: unavailable")
-        return
+    else:
+        print(
+            "At-risk dirty files with missing mirror files: "
+            f"{len(missing)}"
+        )
+        if missing:
+            print(
+                "  These dirty files will be quarantined on a sync pass; "
+                "their remote copies will not be deleted:"
+            )
+            for path in missing[:MISSING_PATH_LIMIT]:
+                print(f"  {path}")
+            remaining = len(missing) - MISSING_PATH_LIMIT
+            if remaining > 0:
+                print(f"  ... and {remaining} more")
 
-    print(
-        "At-risk dirty files with missing mirror files: "
-        f"{len(missing)}"
-    )
-    if not missing:
-        return
-
-    print(
-        "  These dirty files will be quarantined on a sync pass; "
-        "their remote copies will not be deleted:"
-    )
-    for path in missing[:MISSING_PATH_LIMIT]:
-        print(f"  {path}")
-    remaining = len(missing) - MISSING_PATH_LIMIT
-    if remaining > 0:
-        print(f"  ... and {remaining} more")
+    if (
+        not pending_retries
+        and not quarantined_entries
+        and not hydrate_exhausted
+        and not pending_tombstones
+        and not missing
+    ):
+        print(
+            "Queue recovery: no pending retries, quarantined sync entries, "
+            "exhausted hydration, or remote deletions."
+        )
 
 
 def main(argv=None):
@@ -301,9 +409,17 @@ def main(argv=None):
         default=os.path.expanduser("~/.config/icloud-linux/config.yaml"),
         help="Path to config.yaml (default: ~/.config/icloud-linux/config.yaml)",
     )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print a one-line durable queue summary.",
+    )
     args = parser.parse_args(argv)
 
     if not os.path.exists(args.config):
+        if args.summary:
+            print("Queue: unavailable (config not found)")
+            return 0
         print(f"ERROR: config not found: {args.config}", file=sys.stderr)
         return 1
 
@@ -320,6 +436,9 @@ def main(argv=None):
     mirror_root = os.path.join(cache_dir, "mirror")
 
     if not os.path.exists(db_path):
+        if args.summary:
+            print("Queue: no state DB yet")
+            return 0
         print(f"state DB not found: {db_path}")
         print("No queue state exists yet. Start the service to create it.")
         return 0
@@ -329,6 +448,10 @@ def main(argv=None):
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"ERROR: cannot read state DB: {db_path}: {exc}", file=sys.stderr)
         return 1
+
+    if args.summary:
+        print(queue_summary(report))
+        return 0
 
     print_report(args.config, cache_dir, db_path, mirror_root, report)
     return 0

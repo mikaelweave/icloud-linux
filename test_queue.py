@@ -92,6 +92,11 @@ class QueueDiagnosticTests(unittest.TestCase):
         self.assertIn("folder: 1", output)
         self.assertIn("Dirty entries: 1", output)
         self.assertIn("At-risk dirty files with missing mirror files: 0", output)
+        self.assertIn(
+            "Queue recovery: no pending retries, quarantined sync entries, "
+            "exhausted hydration, or remote deletions.",
+            output,
+        )
 
     def test_reports_dirty_files_missing_from_mirror(self):
         conn = self.create_db()
@@ -117,7 +122,7 @@ class QueueDiagnosticTests(unittest.TestCase):
         self.assertIn("Dirty and unhydrated: 1", output)
         self.assertIn("Oldest pending item:", output)
 
-    def test_distinguishes_pending_retries_from_quarantined_entries(self):
+    def test_reports_retry_quarantine_hydration_and_tombstone_details(self):
         conn = self.create_db()
         conn.execute(
             "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
@@ -125,16 +130,25 @@ class QueueDiagnosticTests(unittest.TestCase):
         conn.execute(
             "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
         )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
         conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
         self.add_entry(conn, "/retry.txt", dirty=1)
         self.add_entry(conn, "/quarantined.txt", dirty=1)
+        self.add_entry(conn, "/hydrate.txt")
+        self.add_entry(conn, "/deleted.txt", dirty=1, tombstone=1)
         conn.execute(
             """
             UPDATE entries
-            SET sync_attempt_count = 1, sync_last_error = ?
+            SET sync_attempt_count = 2, sync_next_attempt_at = ?,
+                sync_last_error = ?
             WHERE path = ?
             """,
-            ("temporary outage", "/retry.txt"),
+            (int(time.time()) + 60, "temporary outage", "/retry.txt"),
         )
         conn.execute(
             """
@@ -144,22 +158,39 @@ class QueueDiagnosticTests(unittest.TestCase):
             """,
             ("Mirror file is missing; restore it or delete through FUSE.", "/quarantined.txt"),
         )
+        conn.execute(
+            """
+            UPDATE entries
+            SET hydrate_attempt_count = 8, hydrate_last_error = ?
+            WHERE path = ?
+            """,
+            ("download retry budget exhausted", "/hydrate.txt"),
+        )
         conn.commit()
         conn.close()
 
         result, output = self.run_queue()
 
         self.assertEqual(result, 0)
-        self.assertIn("Pending retries: 1", output)
+        self.assertIn("Pending retries (1):", output)
         self.assertIn(
-            "/retry.txt (failed=0): temporary outage",
+            "/retry.txt (attempt 2; due ",
             output,
         )
-        self.assertIn("Quarantined entries: 1", output)
+        self.assertIn("temporary outage", output)
+        self.assertIn("Sync quarantine — manual action required (1):", output)
         self.assertIn(
-            "/quarantined.txt (failed=1): Mirror file is missing",
+            "/quarantined.txt (attempt 8): Mirror file is missing",
             output,
         )
+        self.assertIn("./icloudctl retry '/quarantined.txt'", output)
+        self.assertIn("Hydration exhausted (1):", output)
+        self.assertIn(
+            "/hydrate.txt (attempt 8): download retry budget exhausted",
+            output,
+        )
+        self.assertIn("Tombstones awaiting remote deletion (1):", output)
+        self.assertIn("/deleted.txt", output)
 
     def test_reports_missing_app_library_as_at_risk(self):
         conn = self.create_db()

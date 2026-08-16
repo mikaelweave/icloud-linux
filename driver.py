@@ -561,6 +561,40 @@ class SyncState:
             )
             self.conn.commit()
 
+    def clear_failures_subtree(self, path=None):
+        if path is None:
+            where_clause = "1 = 1"
+            parameters = ()
+        else:
+            path = normalize_icloud_path(path)
+            if path == "/":
+                where_clause = "1 = 1"
+                parameters = ()
+            else:
+                escaped_path = (
+                    path.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                where_clause = "path = ? OR path LIKE ? ESCAPE '\\'"
+                parameters = (path, escaped_path + "/%")
+        with self.lock:
+            cursor = self.conn.execute(
+                """
+                UPDATE entries
+                SET sync_attempt_count = 0,
+                    sync_next_attempt_at = NULL,
+                    sync_last_error = NULL,
+                    failed = 0,
+                    hydrate_attempt_count = 0,
+                    hydrate_next_attempt_at = NULL,
+                    hydrate_last_error = NULL
+                WHERE """ + where_clause,
+                parameters,
+            )
+            self.conn.commit()
+        return cursor.rowcount
+
     def defer_sync(self, path, delay):
         with self.lock:
             self.conn.execute(
@@ -646,6 +680,17 @@ class SyncState:
                 "UPDATE entries SET hydrate_next_attempt_at = NULL"
             )
             self.conn.commit()
+
+    def count_quarantined_sync_entries(self):
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM entries
+                WHERE failed = 1
+                    AND (dirty = 1 OR tombstone = 1)
+                """
+            ).fetchone()
+        return int(row["count"])
 
     def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
         with self.lock:
@@ -1763,22 +1808,29 @@ class ICloudSyncEngine:
                 break
             self._run_remote_refresh("manual" if manual else "scheduled")
 
-    def sync_dirty_entries(self):
+    def sync_dirty_entries(self, include_deferred=False):
         with self.sync_pass_lock:
+            quarantined_entries = self.state.count_quarantined_sync_entries()
             if self.sync_auth_cooldown_until > time.time():
                 self.logger.info(
                     "Skipping dirty sync during iCloud authentication cooldown"
                 )
-                return
+                return quarantined_entries
             sync_context = SyncPassContext()
             dirty_entries = [
-                entry for entry in self.state.list_dirty_entries()
+                entry for entry in self.state.list_dirty_entries(
+                    include_deferred=include_deferred
+                )
                 if self._entry_allowed_to_sync(entry)
             ]
             if not dirty_entries:
-                return
+                return quarantined_entries
 
-            self._log_sync("dirty-scan", dirty_count=len(dirty_entries))
+            self._log_sync(
+                "dirty-scan",
+                dirty_count=len(dirty_entries),
+                include_deferred=include_deferred,
+            )
 
             tombstones = sorted(
                 [entry for entry in dirty_entries if entry["tombstone"]],
@@ -1794,7 +1846,7 @@ class ICloudSyncEngine:
                 try:
                     self._sync_tombstone(entry, sync_context)
                 except SyncAuthenticationBlocked:
-                    return
+                    return quarantined_entries
 
             for entry in regular:
                 fresh = self.state.get_entry(entry["path"])
@@ -1806,7 +1858,8 @@ class ICloudSyncEngine:
                     else:
                         self._sync_file(fresh, sync_context)
                 except SyncAuthenticationBlocked:
-                    return
+                    return quarantined_entries
+            return quarantined_entries
 
     def _record_sync_failure(self, entry, exc, operation, sync_context=None):
         classification = classify_sync_failure(exc, operation)
@@ -3144,8 +3197,16 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
                 logger.warning("SIGUSR1: sync engine not available (unauthenticated or startup failed)")
                 return
             logger.info("SIGUSR1: starting on-demand remote metadata crawl")
+            quarantined_entries = 0
             try:
                 fs.sync_engine.initial_scan()
+                quarantined_entries = fs.sync_engine.sync_dirty_entries(
+                    include_deferred=True
+                )
+                logger.info(
+                    "SIGUSR1: on-demand sync skipped %s quarantined entries",
+                    quarantined_entries,
+                )
                 logger.info("SIGUSR1: on-demand remote metadata crawl complete")
             except Exception as exc:
                 logger.error("SIGUSR1: on-demand remote metadata crawl failed: %s", exc)
@@ -3155,7 +3216,13 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
                 os.makedirs(state_dir, exist_ok=True)
                 marker = os.path.join(state_dir, "sync_done")
                 with open(marker, "w") as fh:
-                    fh.write(str(time.time()))
+                    json.dump(
+                        {
+                            "completed_at": time.time(),
+                            "quarantined_skipped": quarantined_entries,
+                        },
+                        fh,
+                    )
 
         threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
 

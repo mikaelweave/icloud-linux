@@ -199,6 +199,8 @@ Use `--debug` to see Apple's reported auth mode and diagnose delivery issues:
 ./icloudctl status
 ./icloudctl logs
 ./icloudctl doctor
+./icloudctl queue
+./icloudctl retry [path]
 ./icloudctl hydrate [--dry-run] [--verbose]
 ./icloudctl sync [--timeout SECONDS] [--quiet]
 ./icloudctl clear-cache
@@ -211,11 +213,18 @@ What they do:
 - `stop`: stops the service and unmounts the folder
 - `restart`: restarts the service cleanly
 - `refresh`: asks the running service to crawl remote iCloud Drive metadata now
-- `status`: shows whether the service is running
+- `status`: shows whether the service is running and a one-line durable queue summary
 - `logs`: tails the service logs
 - `doctor`: checks common setup issues
+- `queue`: read-only report of pending retries, sync quarantine, exhausted
+  hydration, and tombstones awaiting remote deletion
+- `retry [path]`: clears sync and hydration retry state for every entry, or
+  recursively for a path and its descendants after you resolve the cause
 - `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading.
-- `sync`: triggers an on-demand remote metadata sync in the running driver (sends SIGUSR1, waits for completion). Useful when `auto_sync: false` is set.
+- `sync`: triggers an on-demand remote metadata sync in the running driver
+  (sends SIGUSR1, waits for completion). It bypasses retry backoff for this
+  pass, but reports quarantined entries that still need `retry`. Useful when
+  `auto_sync: false` is set.
 - `clear-cache`: deletes the local mirror and sync database, then rebuilds them on next start
 - `uninstall`: removes the generated user service
 

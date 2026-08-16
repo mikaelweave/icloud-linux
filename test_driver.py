@@ -865,6 +865,33 @@ class DurableSyncQueueTests(unittest.TestCase):
         self.engine._sync_file.assert_not_called()
         self.assertEqual(self.state.list_dirty_entries(), [])
 
+    def test_explicit_sync_ignores_backoff_and_counts_quarantined_entries(self):
+        self._add_entry("/deferred.txt")
+        self._add_entry("/quarantined.txt")
+        self.state.record_sync_failure(
+            "/deferred.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_sync_failure(
+                "/quarantined.txt",
+                RuntimeError("permanent outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        self.engine._sync_file = Mock()
+
+        skipped = self.engine.sync_dirty_entries(include_deferred=True)
+
+        self.engine._sync_file.assert_called_once()
+        self.assertEqual(
+            self.engine._sync_file.call_args[0][0]["path"],
+            "/deferred.txt",
+        )
+        self.assertEqual(skipped, 1)
+
     def test_auth_failure_does_not_consume_retry_budget(self):
         self.mirror.write("/queued.txt", b"content", 0)
         self._add_entry("/queued.txt")
@@ -948,6 +975,41 @@ class DurableSyncQueueTests(unittest.TestCase):
         self.assertEqual(entry["sync_attempt_count"], 1)
         self.assertEqual(entry["failed"], 1)
         self.assertIsNone(entry["sync_next_attempt_at"])
+
+    def test_clear_failures_subtree_clears_parent_and_children_only(self):
+        for path in ("/parent", "/parent/child.txt", "/sibling.txt"):
+            self._add_entry(
+                path,
+                entry_type="folder" if path == "/parent" else "file",
+            )
+            self.state.record_sync_failure(
+                path,
+                RuntimeError("sync failed"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+            self.state.record_hydrate_failure(
+                path,
+                RuntimeError("download failed"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+
+        cleared = self.state.clear_failures_subtree("/parent")
+
+        self.assertEqual(cleared, 2)
+        for path in ("/parent", "/parent/child.txt"):
+            entry = self.state.get_entry(path)
+            self.assertEqual(entry["sync_attempt_count"], 0)
+            self.assertIsNone(entry["sync_next_attempt_at"])
+            self.assertIsNone(entry["sync_last_error"])
+            self.assertEqual(entry["failed"], 0)
+            self.assertEqual(entry["hydrate_attempt_count"], 0)
+            self.assertIsNone(entry["hydrate_next_attempt_at"])
+            self.assertIsNone(entry["hydrate_last_error"])
+        sibling = self.state.get_entry("/sibling.txt")
+        self.assertEqual(sibling["sync_attempt_count"], 1)
+        self.assertEqual(sibling["hydrate_attempt_count"], 1)
 
     def test_missing_remote_parent_does_not_penalize_child(self):
         self._add_entry("/missing/child.txt")

@@ -189,7 +189,14 @@ cmd_auth() {
 cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user --no-pager status icloud.service || true; }
 cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
-cmd_status() { systemctl --user --no-pager status icloud.service; }
+cmd_status() {
+  systemctl --user --no-pager status icloud.service || true
+  if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_diagnostic.py" --config "$CONFIG_FILE" --summary
+  else
+    echo "Queue: unavailable (virtualenv not initialized)"
+  fi
+}
 cmd_logs() { journalctl --user -u icloud.service -f; }
 cmd_hydrate() {
   ensure_venv
@@ -199,6 +206,11 @@ cmd_hydrate() {
 cmd_queue() {
   ensure_venv
   "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_diagnostic.py" --config "$CONFIG_FILE" "$@"
+}
+
+cmd_retry() {
+  ensure_venv
+  "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_recovery.py" --config "$CONFIG_FILE" "$@"
 }
 
 cmd_sync() {
@@ -381,6 +393,7 @@ Commands:
                            Use before copy tasks to ensure files are fully local.
   queue                    Report local sync queue state without modifying it.
                            Highlights dirty files missing from the local mirror.
+  retry [path]             Clear retry/quarantine state for all entries or a path subtree.
   sync [--timeout SEC] [--quiet]
                            Trigger an on-demand remote sync in the running driver
                            (sends SIGUSR1, waits for completion).  Useful when
@@ -405,6 +418,7 @@ main() {
     auth) cmd_auth "$@" ;;
     hydrate) cmd_hydrate "$@" ;;
     queue) cmd_queue "$@" ;;
+    retry) cmd_retry "$@" ;;
     sync) cmd_sync "$@" ;;
     clear-cache) cmd_clear_cache ;;
     start) cmd_start ;;

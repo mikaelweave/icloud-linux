@@ -17,6 +17,7 @@ Exit codes:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -106,14 +107,29 @@ def main():
             # Read the timestamp inside to confirm it's a fresh marker
             try:
                 with open(MARKER_FILE) as fh:
-                    ts = float(fh.read().strip())
-                # Allow 5s clock skew
-                if ts >= time.time() - (args.timeout + 5):
-                    elapsed = int(time.time() - (deadline - args.timeout))
-                    log(f"Sync complete in ~{elapsed}s.")
-                    sys.exit(0)
-            except (ValueError, OSError):
-                pass
+                    marker_data = fh.read().strip()
+                    try:
+                        marker_data = json.loads(marker_data)
+                    except json.JSONDecodeError:
+                        marker_data = float(marker_data)
+                    if isinstance(marker_data, dict):
+                        ts = float(marker_data["completed_at"])
+                        skipped = int(marker_data.get("quarantined_skipped", 0))
+                    else:
+                        ts = float(marker_data)
+                        skipped = 0
+                    # Allow 5s clock skew
+                    if ts >= time.time() - (args.timeout + 5):
+                        elapsed = int(time.time() - (deadline - args.timeout))
+                        log(f"Sync complete in ~{elapsed}s.")
+                        log(
+                            f"Skipped {skipped} quarantined queue "
+                            f"entr{'y' if skipped == 1 else 'ies'}; "
+                            "inspect with: icloudctl queue"
+                        )
+                        sys.exit(0)
+            except (KeyError, TypeError, ValueError, OSError):
+                    pass
         time.sleep(poll_interval)
 
     print(
