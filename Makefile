@@ -1,4 +1,6 @@
-.PHONY: help quickstart init configure auth start stop restart refresh status logs doctor uninstall
+.PHONY: help quickstart init configure auth start stop restart refresh status logs doctor uninstall test
+
+PYTHON ?= python3
 
 help:
 	@echo "Targets:"
@@ -7,6 +9,7 @@ help:
 	@echo "  make configure    # write credentials config"
 	@echo "  make auth         # run interactive 2FA bootstrap"
 	@echo "  make start|stop|restart|refresh|status|logs|doctor|uninstall"
+	@echo "  make test         # run unittest suite"
 
 quickstart:
 	./icloudctl quickstart
@@ -43,3 +46,6 @@ doctor:
 
 uninstall:
 	./icloudctl uninstall
+
+test:
+	$(PYTHON) -m unittest discover -s . -p 'test_*.py'
