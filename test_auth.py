@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from pyicloud.exceptions import PyiCloudAPIResponseException
 
-from auth import do_sms_forced, sms_code_was_accepted
+from auth import do_sms_forced, get_partition, sms_code_was_accepted
 
 
 def api_error(status, payload, text="sensitive response"):
@@ -20,6 +20,19 @@ def api_error(status, payload, text="sensitive response"):
 
 
 class SmsValidationTests(unittest.TestCase):
+    def test_partition_request_has_connect_and_read_timeouts(self):
+        session = Mock()
+        session.post.return_value.headers = {"x-apple-user-partition": "1"}
+
+        with patch("auth.requests.Session", return_value=session):
+            self.assertEqual(get_partition(), "1")
+
+        session.post.assert_called_once_with(
+            "https://setup.icloud.com/setup/ws/1/validate",
+            json={},
+            timeout=(10, 60),
+        )
+
     def test_recognizes_accepted_409_response(self):
         error = api_error(409, {"securityCode": {"valid": True, "code": "secret"}})
 

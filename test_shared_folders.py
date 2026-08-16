@@ -269,8 +269,10 @@ class SharedFolderEngineTests(unittest.TestCase):
         self.assertTrue(refreshed["hydrated"])
         first_call = self.engine.api.drive.session.get.call_args_list[0]
         self.assertTrue(first_call.args[0].endswith("/v1/item/item-shared"))
+        self.assertEqual(first_call.kwargs["timeout"], (10, 60))
         second_call = self.engine.api.drive.session.get.call_args_list[1]
         self.assertEqual(second_call.args[0], "https://download.example/shared-a.txt")
+        self.assertEqual(second_call.kwargs["timeout"], (10, 300))
         node.open.assert_not_called()
         response.close.assert_called_once()
 
@@ -475,6 +477,10 @@ class SharedFolderEngineTests(unittest.TestCase):
         request_json = self.engine.api.drive.session.post.call_args.kwargs["json"]
         self.assertEqual(request_json["shareID"], shareid)
         self.assertEqual(request_json["destinationDrivewsId"], "shared-root")
+        self.assertEqual(
+            self.engine.api.drive.session.post.call_args.kwargs["timeout"],
+            (10, 60),
+        )
         self.assertEqual(node.data["drivewsid"], "folder-1")
         self.assertEqual(node.data["shareID"], shareid)
 
@@ -540,6 +546,7 @@ class SharedFolderEngineTests(unittest.TestCase):
         call = self.engine.api.drive.session.put.call_args
         self.assertTrue(call.args[0].endswith("/v1/item/item-1"))
         self.assertEqual(call.kwargs["headers"]["Content-Type"], "text/plain")
+        self.assertEqual(call.kwargs["timeout"], (10, 60))
         self.assertEqual(
             json.loads(call.kwargs["data"]),
             {"info_to_update": {"parent_item_id": "trash"}},

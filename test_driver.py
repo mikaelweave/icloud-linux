@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
-from requests.exceptions import Timeout
+from requests.exceptions import ConnectionError, Timeout
 from requests.models import RequestEncodingMixin
 
 from driver import (
@@ -498,6 +498,7 @@ class SyncFailureClassificationTests(unittest.TestCase):
             RuntimeError("network failure"),
             socket.timeout("timed out"),
             Timeout("request timed out"),
+            ConnectionError("connection dropped"),
             malformed_response,
             PyiCloudAPIResponseException("forbidden", "403"),
         )
@@ -555,8 +556,10 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._schedule_all_unhydrated.assert_called_once()
         self.engine._start_background_threads.assert_called_once()
 
-    def test_failed_download_is_retried_with_backoff(self):
-        self.engine.ensure_local_file = Mock(side_effect=RuntimeError("500"))
+    def test_timed_out_download_is_retried_with_backoff(self):
+        self.engine.ensure_local_file = Mock(
+            side_effect=Timeout("request timed out")
+        )
         self.engine._schedule_download_with_delay = Mock()
         self.engine.scheduled_downloads.add("/docs/a.txt")
 
@@ -812,6 +815,23 @@ class DurableSyncQueueTests(unittest.TestCase):
             [item["path"] for item in self.state.list_dirty_entries(include_deferred=True)],
             ["/queued.txt"],
         )
+
+    def test_request_timeout_defers_entry_without_quarantining(self):
+        self._add_entry("/queued.txt")
+        self.mirror.write("/queued.txt", b"content", 0)
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock(
+            side_effect=Timeout("request timed out")
+        )
+
+        self.engine._sync_file(self.state.get_entry("/queued.txt"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 1)
+        self.assertEqual(entry["failed"], 0)
+        self.assertGreater(entry["sync_next_attempt_at"], int(time.time()))
 
     def test_retry_budget_quarantines_entry_after_eight_failures(self):
         self._add_entry("/queued.txt")

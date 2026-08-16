@@ -28,6 +28,7 @@ DB_PATH     = os.path.join(CACHE_DIR, "state.sqlite3")
 COOKIE_DIR  = os.path.expanduser(config.get("cookie_dir", "~/.config/icloud-linux/cookies"))
 USERNAME    = config["username"]
 PASSWORD    = config["password"]
+PARTITION_REQUEST_TIMEOUT = (10, 60)
 
 TARGET = sys.argv[1] if len(sys.argv) > 1 else "/Downloads/Move2"
 if not TARGET.startswith("/"):
@@ -37,7 +38,11 @@ log.info("Target: %s", TARGET)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 log.info("Authenticating as %s ...", USERNAME)
-_r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+_r = _req.post(
+    "https://setup.icloud.com/setup/ws/1/validate",
+    json={},
+    timeout=PARTITION_REQUEST_TIMEOUT,
+)
 _partition = _r.headers.get("x-apple-user-partition")
 api = PyiCloudService(USERNAME, PASSWORD,
                       cookie_directory=COOKIE_DIR, authenticate=False)

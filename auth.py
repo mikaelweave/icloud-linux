@@ -30,6 +30,8 @@ from pyicloud.exceptions import (
     PyiCloudAPIResponseException,
 )
 
+PARTITION_REQUEST_TIMEOUT = (10, 60)
+
 
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -44,7 +46,11 @@ def get_partition():
         "Referer": "https://www.icloud.com/",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     })
-    r = s.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+    r = s.post(
+        "https://setup.icloud.com/setup/ws/1/validate",
+        json={},
+        timeout=PARTITION_REQUEST_TIMEOUT,
+    )
     return r.headers.get("x-apple-user-partition")
 
 

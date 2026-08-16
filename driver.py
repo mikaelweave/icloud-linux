@@ -50,6 +50,8 @@ SYNC_FAILURE_TERMINAL = "terminal"
 SYNC_FAILURE_TRANSIENT = "transient"
 MAX_SYNC_ATTEMPTS = 8
 AUTH_SYNC_COOLDOWN_SECONDS = 300
+CONTROL_PLANE_TIMEOUT = (10, 60)
+DOWNLOAD_TIMEOUT = (10, 300)
 AUTH_ERROR_TYPES = (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
@@ -2062,6 +2064,7 @@ class ICloudSyncEngine:
             params=self.api.drive.params,
             headers=headers,
             json=request_payload,
+            timeout=CONTROL_PLANE_TIMEOUT,
         )
         self.api.drive._raise_if_error(request)
         return request.json()
@@ -2118,6 +2121,7 @@ class ICloudSyncEngine:
             f"{self.api.drive._document_root}/v1/item/{item_id}",
             headers={"Content-Type": "text/plain"},
             data=json.dumps(payload),
+            timeout=CONTROL_PLANE_TIMEOUT,
         )
         self.api.drive._raise_if_error(request)
         return request.json()
@@ -2129,13 +2133,20 @@ class ICloudSyncEngine:
         request = self.api.drive.session.get(
             f"{self.api.drive._document_root}/v1/item/{item_id}",
             params=self.api.drive.params,
+            timeout=CONTROL_PLANE_TIMEOUT,
         )
         self.api.drive._raise_if_error(request)
         item_info = request.json().get("item_info", {})
         url = item_info.get("urls", {}).get("url_download")
         if not url:
             raise KeyError(f"Shared download URL missing for {node.name}")
-        return self.api.drive.session.get(url, params=self.api.drive.params, **kwargs)
+        # The read timeout limits inactivity between bytes, not total transfer time.
+        return self.api.drive.session.get(
+            url,
+            params=self.api.drive.params,
+            timeout=DOWNLOAD_TIMEOUT,
+            **kwargs,
+        )
 
     def _open_remote_file(self, node, entry, path, **kwargs):
         if entry.get("remote_shareid"):
