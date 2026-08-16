@@ -333,6 +333,14 @@ To let another user or container access the FUSE mount itself, set
 `fuse_options.allow_other: true`. On most hosts this also requires
 `user_allow_other` in `/etc/fuse.conf`.
 
+**Deleting files from the mirror does not delete them from iCloud.** Deletions
+must go through the FUSE mount. If a file's mirror copy disappears while the
+entry is still pending upload, the driver cannot tell an intentional deletion
+apart from a lost or half-written mirror, so it quarantines the entry and leaves
+the remote copy untouched rather than guessing. Quarantined entries are listed by
+`icloudctl queue`; restore the file, or delete it through the mount, then run
+`icloudctl retry <path>`.
+
 ## Copying Files to Another Location
 
 Once files are hydrated, copy from the local mirror rather than from the FUSE mount:
