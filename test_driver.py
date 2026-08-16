@@ -6,6 +6,8 @@ import sqlite3
 import socket
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 from requests.exceptions import Timeout
@@ -15,6 +17,7 @@ from driver import (
     ICloudFS,
     ICloudSyncEngine,
     LocalMirror,
+    MAX_SYNC_ATTEMPTS,
     NamedFileStream,
     SYNC_FAILURE_AUTH,
     SYNC_FAILURE_TERMINAL,
@@ -754,6 +757,310 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["prefix"], b"hello")
 
 
+class DurableSyncQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.logger = Mock()
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            self.logger,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def _add_entry(self, path, entry_type="file", remote_drivewsid=None):
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": entry_type,
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": remote_drivewsid,
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+
+    def test_transient_failure_defers_dirty_entry(self):
+        self._add_entry("/queued.txt")
+
+        attempt, quarantined = self.state.record_sync_failure(
+            "/queued.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(attempt, 1)
+        self.assertFalse(quarantined)
+        self.assertEqual(entry["sync_attempt_count"], 1)
+        self.assertGreater(entry["sync_next_attempt_at"], int(time.time()))
+        self.assertEqual(self.state.list_dirty_entries(), [])
+        self.assertEqual(
+            [item["path"] for item in self.state.list_dirty_entries(include_deferred=True)],
+            ["/queued.txt"],
+        )
+
+    def test_retry_budget_quarantines_entry_after_eight_failures(self):
+        self._add_entry("/queued.txt")
+
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            attempt, quarantined = self.state.record_sync_failure(
+                "/queued.txt",
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(attempt, MAX_SYNC_ATTEMPTS)
+        self.assertTrue(quarantined)
+        self.assertEqual(entry["failed"], 1)
+
+    def test_quarantined_entry_is_not_retried(self):
+        self._add_entry("/queued.txt")
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_sync_failure(
+                "/queued.txt",
+                RuntimeError("temporary outage"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        self.engine._sync_file = Mock()
+
+        self.engine.sync_dirty_entries()
+
+        self.engine._sync_file.assert_not_called()
+        self.assertEqual(self.state.list_dirty_entries(), [])
+
+    def test_auth_failure_does_not_consume_retry_budget(self):
+        self.mirror.write("/queued.txt", b"content", 0)
+        self._add_entry("/queued.txt")
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+
+        self.engine._sync_file(self.state.get_entry("/queued.txt"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertIsNotNone(entry["sync_next_attempt_at"])
+
+    def test_delete_not_found_resolves_tombstone_without_quarantine(self):
+        self._add_entry("/removed", entry_type="folder", remote_drivewsid="folder-1")
+        self.state.mark_tombstone("/removed")
+        self._add_entry("/removed/child.txt", remote_drivewsid="file-1")
+        self.state.mark_tombstone("/removed/child.txt")
+        node = Mock()
+        node.delete.side_effect = PyiCloudAPIResponseException("not found", 404)
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine._sync_tombstone(self.state.get_entry("/removed"))
+
+        self.assertIsNone(self.state.get_entry("/removed"))
+        self.assertIsNone(self.state.get_entry("/removed/child.txt"))
+
+    def test_success_clears_retry_state(self):
+        self._add_entry("/queued.txt")
+        self.state.record_sync_failure(
+            "/queued.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+
+        self.state.mark_clean("/queued.txt")
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertIsNone(entry["sync_last_error"])
+        self.assertIsNone(entry["sync_next_attempt_at"])
+        self.assertEqual(entry["failed"], 0)
+
+    def test_clear_sync_backoff_preserves_attempts_and_quarantine(self):
+        self._add_entry("/queued.txt")
+        self.state.record_sync_failure(
+            "/queued.txt",
+            RuntimeError("temporary outage"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+        self.state.conn.execute(
+            "UPDATE entries SET failed = 1 WHERE path = ?",
+            ("/queued.txt",),
+        )
+        self.state.conn.commit()
+
+        self.state.clear_sync_backoff()
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 1)
+        self.assertEqual(entry["failed"], 1)
+        self.assertIsNone(entry["sync_next_attempt_at"])
+
+    def test_missing_remote_parent_does_not_penalize_child(self):
+        self._add_entry("/missing/child.txt")
+
+        self.engine._sync_file(self.state.get_entry("/missing/child.txt"))
+
+        entry = self.state.get_entry("/missing/child.txt")
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertEqual(entry["failed"], 0)
+
+    def test_child_recovers_after_parent_quarantine_is_cleared(self):
+        self.mirror.ensure_dir("/parent")
+        self.mirror.write("/parent/child.txt", b"content", 0)
+        self._add_entry("/parent", entry_type="folder", remote_drivewsid="parent-1")
+        self._add_entry("/parent/child.txt")
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_sync_failure(
+                "/parent",
+                RuntimeError("parent failure"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+
+        self.engine.sync_dirty_entries()
+
+        child = self.state.get_entry("/parent/child.txt")
+        self.assertEqual(child["sync_attempt_count"], 0)
+        self.assertEqual(child["failed"], 0)
+
+        self.state.clear_sync_failure("/parent")
+        parent_node = Mock()
+        parent_node.data = {}
+        self.engine._node_from_entry = Mock(return_value=parent_node)
+        self.engine._refresh_child_meta = Mock(
+            return_value={
+                "path": "/parent/child.txt",
+                "type": "file",
+                "parent_path": "/parent",
+                "remote_drivewsid": "child-1",
+                "remote_docwsid": "child-doc-1",
+                "remote_etag": "child-etag-1",
+                "remote_zone": "zone-1",
+                "size": 7,
+                "mtime": 123,
+            }
+        )
+
+        self.engine.sync_dirty_entries()
+
+        child = self.state.get_entry("/parent/child.txt")
+        self.assertFalse(child["dirty"])
+        self.assertEqual(child["sync_attempt_count"], 0)
+
+    def test_parent_backoff_blocks_child_without_retrying_parent(self):
+        self._add_entry("/parent", entry_type="folder", remote_drivewsid="parent-1")
+        self._add_entry("/parent/child.txt")
+        self.state.record_sync_failure(
+            "/parent",
+            RuntimeError("parent failure"),
+            SYNC_FAILURE_TRANSIENT,
+            MAX_SYNC_ATTEMPTS,
+        )
+        self.engine._sync_directory = Mock()
+        self.engine._node_from_entry = Mock()
+
+        self.engine.sync_dirty_entries()
+
+        child = self.state.get_entry("/parent/child.txt")
+        self.engine._sync_directory.assert_not_called()
+        self.engine._node_from_entry.assert_not_called()
+        self.assertEqual(child["sync_attempt_count"], 0)
+        self.assertEqual(child["failed"], 0)
+
+    def test_overlapping_sync_passes_are_serialized(self):
+        self._add_entry("/queued.txt")
+        started = threading.Event()
+        release = threading.Event()
+        active_lock = threading.Lock()
+        active = 0
+        max_active = 0
+        errors = []
+
+        def sync_file(entry, sync_context=None):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            started.set()
+            release.wait(2)
+            with active_lock:
+                active -= 1
+
+        def run_sync():
+            try:
+                self.engine.sync_dirty_entries()
+            except Exception as exc:
+                errors.append(exc)
+
+        self.engine._sync_file = Mock(side_effect=sync_file)
+        first = threading.Thread(target=run_sync)
+        second = threading.Thread(target=run_sync)
+        first.start()
+        self.assertTrue(started.wait(1))
+        second.start()
+        time.sleep(0.1)
+        release.set()
+        first.join(2)
+        second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active, 1)
+
+    def test_auth_failure_aborts_remaining_sync_entries(self):
+        self.mirror.write("/first.txt", b"first", 0)
+        self.mirror.write("/second.txt", b"second", 0)
+        self._add_entry("/first.txt")
+        self._add_entry("/second.txt")
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+
+        self.engine.sync_dirty_entries()
+
+        self.engine.ensure_local_file.assert_called_once_with("/first.txt")
+        self.assertEqual(
+            self.state.get_entry("/first.txt")["sync_attempt_count"],
+            0,
+        )
+        self.assertEqual(
+            self.state.get_entry("/second.txt")["sync_attempt_count"],
+            0,
+        )
+        self.assertGreater(self.engine.sync_auth_cooldown_until, time.time())
+        self.logger.error.assert_called_once()
+
+    def test_failed_parent_is_attempted_once_per_sync_pass(self):
+        self._add_entry("/parent", entry_type="folder")
+        self._add_entry("/parent/first.txt")
+        self._add_entry("/parent/second.txt")
+        self.engine._create_remote_directory = Mock(
+            side_effect=RuntimeError("remote unavailable")
+        )
+
+        self.engine.sync_dirty_entries()
+
+        self.engine._create_remote_directory.assert_called_once()
+
+
 class ICloudFSInitializationTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
@@ -946,8 +1253,10 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
 
         self.engine.sync_dirty_entries()
 
-        self.engine._sync_file.assert_called_once_with(
-            self.state.get_entry("/allowed/file.txt")
+        self.engine._sync_file.assert_called_once()
+        self.assertEqual(
+            self.engine._sync_file.call_args.args[0],
+            self.state.get_entry("/allowed/file.txt"),
         )
 
     def test_empty_sync_paths_preserve_unrestricted_behavior(self):

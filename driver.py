@@ -48,12 +48,32 @@ DEFAULT_DIR_MODE = 0o755
 SYNC_FAILURE_AUTH = "auth"
 SYNC_FAILURE_TERMINAL = "terminal"
 SYNC_FAILURE_TRANSIENT = "transient"
+MAX_SYNC_ATTEMPTS = 8
+AUTH_SYNC_COOLDOWN_SECONDS = 300
 AUTH_ERROR_TYPES = (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
     PyiCloudAuthRequiredException,
     PyiCloudFailedLoginException,
 )
+
+
+def _retry_delay_for_attempt(attempt):
+    return min(300, 5 * (2 ** max(0, attempt - 1)))
+
+
+class SyncBlocked(Exception):
+    pass
+
+
+class SyncAuthenticationBlocked(Exception):
+    pass
+
+
+class SyncPassContext:
+    def __init__(self):
+        self.failed_remote_parents = set()
+        self.auth_failure_logged = False
 
 
 def _http_status_from_exception(exc):
@@ -347,6 +367,7 @@ class SyncState:
                         ON entries(dirty, tombstone, failed, sync_next_attempt_at)
                     """
                 )
+            self.clear_sync_backoff()
             self.conn.commit()
 
     def close(self):
@@ -451,16 +472,92 @@ class SyncState:
             ).fetchall()
         return [row["path"] for row in rows]
 
-    def list_dirty_entries(self):
+    def list_dirty_entries(self, include_deferred=False):
+        query = """
+            SELECT * FROM entries
+            WHERE (dirty = 1 OR tombstone = 1)
+                AND failed = 0
+        """
+        parameters = []
+        if not include_deferred:
+            query += """
+                AND (
+                    sync_next_attempt_at IS NULL
+                    OR sync_next_attempt_at <= ?
+                )
+            """
+            parameters.append(int(time.time()))
+        query += " ORDER BY path"
         with self.lock:
-            rows = self.conn.execute(
-                """
-                SELECT * FROM entries
-                WHERE dirty = 1 OR tombstone = 1
-                ORDER BY path
-                """
-            ).fetchall()
+            rows = self.conn.execute(query, parameters).fetchall()
         return [self._decode_entry(dict(row)) for row in rows]
+
+    def record_sync_failure(self, path, error, classification, max_attempts):
+        error_text = str(error)[:500]
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT sync_attempt_count FROM entries WHERE path = ?",
+                (path,),
+            ).fetchone()
+            if row is None:
+                return 0, False
+            attempt = int(row["sync_attempt_count"]) + 1
+            quarantined = (
+                classification == SYNC_FAILURE_TERMINAL
+                or attempt >= max_attempts
+            )
+            next_attempt_at = (
+                None
+                if quarantined
+                else int(time.time()) + _retry_delay_for_attempt(attempt)
+            )
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET sync_attempt_count = ?,
+                    sync_next_attempt_at = ?,
+                    sync_last_error = ?,
+                    failed = ?
+                WHERE path = ?
+                """,
+                (attempt, next_attempt_at, error_text, int(quarantined), path),
+            )
+            self.conn.commit()
+        return attempt, quarantined
+
+    def clear_sync_failure(self, path):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET sync_attempt_count = 0,
+                    sync_next_attempt_at = NULL,
+                    sync_last_error = NULL,
+                    failed = 0
+                WHERE path = ?
+                """,
+                (path,),
+            )
+            self.conn.commit()
+
+    def defer_sync(self, path, delay):
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE entries
+                SET sync_next_attempt_at = ?
+                WHERE path = ?
+                """,
+                (int(time.time()) + int(delay), path),
+            )
+            self.conn.commit()
+
+    def clear_sync_backoff(self):
+        with self.lock:
+            self.conn.execute(
+                "UPDATE entries SET sync_next_attempt_at = NULL"
+            )
+            self.conn.commit()
 
     def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
         with self.lock:
@@ -530,7 +627,11 @@ class SyncState:
                     mtime = COALESCE(?, mtime),
                     local_sha256 = COALESCE(?, local_sha256),
                     last_synced_at = ?,
-                    synced_path = path
+                    synced_path = path,
+                    sync_attempt_count = 0,
+                    sync_next_attempt_at = NULL,
+                    sync_last_error = NULL,
+                    failed = 0
                 WHERE path = ?
                 """,
                 (
@@ -661,10 +762,36 @@ class SyncState:
                         WHEN path = ? THEN 0
                         ELSE tombstone
                     END,
+                    sync_attempt_count = CASE
+                        WHEN path = ? THEN 0
+                        ELSE sync_attempt_count
+                    END,
+                    sync_next_attempt_at = CASE
+                        WHEN path = ? THEN NULL
+                        ELSE sync_next_attempt_at
+                    END,
+                    sync_last_error = CASE
+                        WHEN path = ? THEN NULL
+                        ELSE sync_last_error
+                    END,
+                    failed = CASE
+                        WHEN path = ? THEN 0
+                        ELSE failed
+                    END,
                     last_synced_at = ?
                 WHERE path = ? OR path LIKE ?
                 """,
-                (path, path, int(time.time()), path, prefix + "%"),
+                (
+                    path,
+                    path,
+                    path,
+                    path,
+                    path,
+                    path,
+                    int(time.time()),
+                    path,
+                    prefix + "%",
+                ),
             )
             self.conn.commit()
 
@@ -961,6 +1088,8 @@ class ICloudSyncEngine:
         self.downloads_lock = threading.Lock()
         self.download_retry_attempts = {}
         self.download_retry_timers = {}
+        self.sync_pass_lock = threading.Lock()
+        self.sync_auth_cooldown_until = 0
         self.threads = []
         self.hydration_total = 0
         self.hydration_completed = 0
@@ -1421,7 +1550,7 @@ class ICloudSyncEngine:
                 self.scheduled_downloads.discard(path)
 
     def _retry_delay_for_attempt(self, attempt):
-        return min(300, 5 * (2 ** max(0, attempt - 1)))
+        return _retry_delay_for_attempt(attempt)
 
     def _is_auth_error(self, exc):
         return classify_sync_failure(exc, None) == SYNC_FAILURE_AUTH
@@ -1505,55 +1634,126 @@ class ICloudSyncEngine:
             self._run_remote_refresh("manual" if manual else "scheduled")
 
     def sync_dirty_entries(self):
-        dirty_entries = [
-            entry for entry in self.state.list_dirty_entries()
-            if self._entry_allowed_to_sync(entry)
-        ]
-        if not dirty_entries:
-            return
+        with self.sync_pass_lock:
+            if self.sync_auth_cooldown_until > time.time():
+                self.logger.info(
+                    "Skipping dirty sync during iCloud authentication cooldown"
+                )
+                return
+            sync_context = SyncPassContext()
+            dirty_entries = [
+                entry for entry in self.state.list_dirty_entries()
+                if self._entry_allowed_to_sync(entry)
+            ]
+            if not dirty_entries:
+                return
 
-        self._log_sync("dirty-scan", dirty_count=len(dirty_entries))
+            self._log_sync("dirty-scan", dirty_count=len(dirty_entries))
 
-        tombstones = sorted(
-            [entry for entry in dirty_entries if entry["tombstone"]],
-            key=lambda entry: (entry["path"].count("/"), entry["path"]),
-            reverse=True,
+            tombstones = sorted(
+                [entry for entry in dirty_entries if entry["tombstone"]],
+                key=lambda entry: (entry["path"].count("/"), entry["path"]),
+                reverse=True,
+            )
+            regular = sorted(
+                [entry for entry in dirty_entries if not entry["tombstone"]],
+                key=lambda entry: (entry["type"] != "folder", entry["path"].count("/"), entry["path"]),
+            )
+
+            for entry in tombstones:
+                try:
+                    self._sync_tombstone(entry, sync_context)
+                except SyncAuthenticationBlocked:
+                    return
+
+            for entry in regular:
+                fresh = self.state.get_entry(entry["path"])
+                if fresh is None or fresh["tombstone"] or not fresh["dirty"]:
+                    continue
+                try:
+                    if fresh["type"] == "folder":
+                        self._sync_directory(fresh, sync_context)
+                    else:
+                        self._sync_file(fresh, sync_context)
+                except SyncAuthenticationBlocked:
+                    return
+
+    def _record_sync_failure(self, entry, exc, operation, sync_context=None):
+        classification = classify_sync_failure(exc, operation)
+        if classification == SYNC_FAILURE_AUTH:
+            self.state.defer_sync(
+                entry["path"],
+                self._retry_delay_for_attempt(1),
+            )
+            self.sync_auth_cooldown_until = (
+                time.time() + AUTH_SYNC_COOLDOWN_SECONDS
+            )
+            if sync_context is None or not sync_context.auth_failure_logged:
+                self.logger.error(
+                    "Sync %s blocked by iCloud authentication for %s: %s",
+                    operation,
+                    entry["path"],
+                    exc,
+                )
+                if sync_context is not None:
+                    sync_context.auth_failure_logged = True
+            return True
+        attempt, quarantined = self.state.record_sync_failure(
+            entry["path"],
+            exc,
+            classification,
+            MAX_SYNC_ATTEMPTS,
         )
-        regular = sorted(
-            [entry for entry in dirty_entries if not entry["tombstone"]],
-            key=lambda entry: (entry["type"] != "folder", entry["path"].count("/"), entry["path"]),
+        if quarantined:
+            self.logger.error(
+                "Sync %s failed for %s (attempt %s): %s; quarantined",
+                operation,
+                entry["path"],
+                attempt,
+                exc,
+            )
+            return False
+        self.logger.error(
+            "Sync %s failed for %s (attempt %s): %s; retrying later",
+            operation,
+            entry["path"],
+            attempt,
+            exc,
         )
+        return False
 
-        for entry in tombstones:
-            self._sync_tombstone(entry)
+    def _mark_remote_parent_failed(self, path, sync_context):
+        sync_context.failed_remote_parents.add(path)
 
-        for entry in regular:
-            fresh = self.state.get_entry(entry["path"])
-            if fresh is None or fresh["tombstone"] or not fresh["dirty"]:
-                continue
-            if fresh["type"] == "folder":
-                self._sync_directory(fresh)
-            else:
-                self._sync_file(fresh)
-
-    def _sync_tombstone(self, entry):
+    def _sync_tombstone(self, entry, sync_context=None):
+        is_sync_pass = sync_context is not None
         self._log_sync("delete-start", path=entry["path"], remote=bool(entry["remote_drivewsid"]))
         if entry["remote_drivewsid"]:
             try:
                 node = self._node_from_entry(entry)
                 node.delete()
             except Exception as exc:
-                self.logger.error("Failed deleting remote path %s: %s", entry["path"], exc)
-                return
+                if classify_sync_failure(exc, "delete") != SYNC_FAILURE_TERMINAL:
+                    if self._record_sync_failure(
+                        entry, exc, "delete", sync_context
+                    ):
+                        if is_sync_pass:
+                            raise SyncAuthenticationBlocked()
+                    return
+                self.logger.info(
+                    "Remote path %s was already deleted; resolving tombstone",
+                    entry["path"],
+                )
+        self.state.clear_sync_failure(entry["path"])
         self.state.remove_subtree(entry["path"])
         self._log_sync("delete-complete", path=entry["path"])
 
-    def _sync_directory(self, entry):
-        parent_node = self._ensure_remote_parent(entry["path"])
-        if parent_node is None:
-            return
-
+    def _sync_directory(self, entry, sync_context=None):
+        is_sync_pass = sync_context is not None
+        if sync_context is None:
+            sync_context = SyncPassContext()
         try:
+            parent_node = self._ensure_remote_parent(entry["path"], sync_context)
             self._log_sync(
                 "directory-sync-start",
                 path=entry["path"],
@@ -1585,20 +1785,31 @@ class ICloudSyncEngine:
             if entry["synced_path"] and entry["synced_path"] != entry["path"]:
                 if is_shared:
                     self._sync_shared_directory(entry, parent_node)
+                    self.state.clear_sync_failure(entry["path"])
                     self._log_sync("directory-sync-complete", path=entry["path"])
                     return
                 self._sync_move_or_rename(entry)
             self.state.mark_synced_subtree(entry["path"])
             self._log_sync("directory-sync-complete", path=entry["path"])
+        except SyncBlocked as exc:
+            self.logger.info(
+                "Sync directory %s blocked by ancestor: %s", entry["path"], exc
+            )
+        except SyncAuthenticationBlocked:
+            raise
         except Exception as exc:
-            self.logger.error("Failed syncing directory %s: %s", entry["path"], exc)
+            if self._record_sync_failure(entry, exc, "upload", sync_context):
+                if is_sync_pass:
+                    raise SyncAuthenticationBlocked()
+                return
+            self._mark_remote_parent_failed(entry["path"], sync_context)
 
-    def _sync_file(self, entry):
-        parent_node = self._ensure_remote_parent(entry["path"])
-        if parent_node is None:
-            return
-
+    def _sync_file(self, entry, sync_context=None):
+        is_sync_pass = sync_context is not None
+        if sync_context is None:
+            sync_context = SyncPassContext()
         try:
+            parent_node = self._ensure_remote_parent(entry["path"], sync_context)
             self._log_sync(
                 "file-sync-start",
                 path=entry["path"],
@@ -1641,9 +1852,19 @@ class ICloudSyncEngine:
                 )
                 checksum = self.mirror.file_sha256(entry["path"])
                 self.state.mark_clean(entry["path"], meta, checksum)
+            self.state.clear_sync_failure(entry["path"])
             self._log_sync("file-sync-complete", path=entry["path"], size=meta.get("size"))
+        except SyncBlocked as exc:
+            self.logger.info(
+                "Sync file %s blocked by ancestor: %s", entry["path"], exc
+            )
+        except SyncAuthenticationBlocked:
+            raise
         except Exception as exc:
-            self.logger.error("Failed syncing file %s: %s", entry["path"], exc)
+            if self._record_sync_failure(entry, exc, "upload", sync_context):
+                if is_sync_pass:
+                    raise SyncAuthenticationBlocked()
+                return
 
     def _sync_move_or_rename(self, entry):
         synced_path = entry["synced_path"]
@@ -1686,19 +1907,42 @@ class ICloudSyncEngine:
         )
         return False
 
-    def _ensure_remote_parent(self, path):
+    def _ensure_remote_parent(self, path, sync_context=None):
+        if sync_context is None:
+            sync_context = SyncPassContext()
         parent_path = os.path.dirname(path) or "/"
         if parent_path == "/":
             return self.api.drive.root
+        if parent_path in sync_context.failed_remote_parents:
+            raise SyncBlocked(f"Remote parent unavailable: {parent_path}")
         parent_entry = self.state.get_entry(parent_path)
         if not parent_entry:
-            return None
+            self._mark_remote_parent_failed(parent_path, sync_context)
+            raise SyncBlocked(f"Remote parent unavailable: {parent_path}")
+        if parent_entry["failed"]:
+            self._mark_remote_parent_failed(parent_path, sync_context)
+            raise SyncBlocked(f"Remote parent quarantined: {parent_path}")
+        next_attempt_at = parent_entry["sync_next_attempt_at"]
+        if next_attempt_at is not None and next_attempt_at > int(time.time()):
+            self._mark_remote_parent_failed(parent_path, sync_context)
+            raise SyncBlocked(f"Remote parent deferred: {parent_path}")
         if parent_entry["dirty"]:
-            self._sync_directory(parent_entry)
+            self._sync_directory(parent_entry, sync_context)
             parent_entry = self.state.get_entry(parent_path)
+        if parent_path in sync_context.failed_remote_parents:
+            raise SyncBlocked(f"Remote parent unavailable: {parent_path}")
         if not parent_entry or not parent_entry["remote_drivewsid"]:
-            return None
-        return self._node_from_entry(parent_entry)
+            self._mark_remote_parent_failed(parent_path, sync_context)
+            raise SyncBlocked(f"Remote parent unavailable: {parent_path}")
+        try:
+            return self._node_from_entry(parent_entry)
+        except Exception as exc:
+            if self._record_sync_failure(
+                parent_entry, exc, "upload", sync_context
+            ):
+                raise SyncAuthenticationBlocked()
+            self._mark_remote_parent_failed(parent_path, sync_context)
+            raise SyncBlocked(f"Remote parent unavailable: {parent_path}")
 
     def _refresh_child_meta(self, parent_path, child_name, inherited_shareid=None):
         parent = self._remote_node_for_path(parent_path)
