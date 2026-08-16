@@ -231,6 +231,11 @@ What they do:
   recursively for a path and its descendants after you resolve the cause; it
   also asks a running service to reschedule the recovered entries, and clears
   any unpersisted-failure records for that path
+
+If the cache directory itself becomes unwritable, neither the database nor the
+fallback log can record a failure, so `queue` cannot report it. The driver logs
+a `QUEUE UNRELIABLE` message in that case; check `logs` and free space on the
+cache directory if you ever see one.
 - `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading.
 - `sync`: triggers an on-demand remote metadata sync in the running driver
   (sends SIGUSR1, waits for completion). It bypasses retry backoff for this

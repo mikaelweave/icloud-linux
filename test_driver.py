@@ -2399,7 +2399,11 @@ class HydrationFailureFUSETests(unittest.TestCase):
         with patch("builtins.open", side_effect=OSError("disk full")):
             self.assertEqual(self.fs.open(path, os.O_RDONLY), -errno.EIO)
 
-        self.assertGreaterEqual(self.fs.logger.error.call_count, 2)
+        # Neither the database nor the fallback log could record this, so the
+        # log is the only remaining signal and must be CRITICAL and explicit.
+        self.assertEqual(self.fs.logger.critical.call_count, 1)
+        message = self.fs.logger.critical.call_args[0][0]
+        self.assertIn("QUEUE UNRELIABLE", message)
 
     def test_open_auth_hydration_failure_is_queue_blocked_without_attempt(self):
         path = "/expired-session.txt"

@@ -2728,11 +2728,24 @@ class ICloudFS(Fuse):
             }
             with open(marker_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
         except Exception as marker_exc:
-            self.logger.error(
-                "Failed writing unrecorded hydration failure marker for %s: %s",
+            # Both the database and the fallback log are unwritable, so no
+            # durable record of this failure can exist and the queue is no
+            # longer a complete picture. This log line is the only remaining
+            # signal, so make it impossible to miss.
+            self.logger.critical(
+                "QUEUE UNRELIABLE: could not record the hydration failure for %s "
+                "in the database (%s) or in the fallback log (%s). This file is "
+                "stuck and will NOT appear in './icloudctl queue'. Check free "
+                "space and permissions on the cache directory %s, then run "
+                "'./icloudctl retry %s'.",
                 path,
+                record_exc,
                 marker_exc,
+                self.cache_dir,
+                path,
             )
 
     def _mutation_allowed(self, operation, *paths):
