@@ -11,6 +11,7 @@ from requests.models import RequestEncodingMixin
 
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
+from queue_diagnostic import open_read_only
 
 
 class NoUnboundedReadStream(io.BytesIO):
@@ -236,7 +237,7 @@ class DriverStateTests(unittest.TestCase):
 
         self.assertEqual(entry["remote_shareid"], {"share-zone": "abc"})
 
-    def test_existing_state_db_is_migrated_for_remote_shareid(self):
+    def test_existing_state_db_migrates_durable_queue_schema_and_drops_pending_ops(self):
         legacy_db = os.path.join(self.root, "legacy.sqlite3")
         conn = sqlite3.connect(legacy_db)
         conn.execute(
@@ -260,13 +261,148 @@ class DriverStateTests(unittest.TestCase):
             )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO entries (path, type, parent_path)
+            VALUES ('/legacy.txt', 'file', '/')
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_entries_dirty
+                ON entries(dirty, tombstone)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE pending_ops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op TEXT NOT NULL,
+                path TEXT NOT NULL,
+                target_path TEXT,
+                queued_at INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO pending_ops (op, path, queued_at)
+            VALUES ('update', '/legacy.txt', 1)
+            """
+        )
         conn.commit()
         conn.close()
 
         migrated = SyncState(legacy_db)
         columns = migrated.conn.execute("PRAGMA table_info(entries)").fetchall()
+        column_names = {column["name"] for column in columns}
+        entry = migrated.get_entry("/legacy.txt")
+        index_columns = [
+            column["name"]
+            for column in migrated.conn.execute(
+                "PRAGMA index_info('idx_entries_dirty')"
+            ).fetchall()
+        ]
 
-        self.assertIn("remote_shareid", {column["name"] for column in columns})
+        self.assertIn("remote_shareid", column_names)
+        self.assertTrue(
+            {
+                "sync_attempt_count",
+                "sync_next_attempt_at",
+                "sync_last_error",
+                "hydrate_attempt_count",
+                "hydrate_next_attempt_at",
+                "hydrate_last_error",
+                "failed",
+            }
+            <= column_names
+        )
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertIsNone(entry["sync_next_attempt_at"])
+        self.assertIsNone(entry["sync_last_error"])
+        self.assertEqual(entry["hydrate_attempt_count"], 0)
+        self.assertIsNone(entry["hydrate_next_attempt_at"])
+        self.assertIsNone(entry["hydrate_last_error"])
+        self.assertEqual(entry["failed"], 0)
+        self.assertIsNone(
+            migrated.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pending_ops'"
+            ).fetchone()
+        )
+        self.assertEqual(
+            index_columns,
+            ["dirty", "tombstone", "failed", "sync_next_attempt_at"],
+        )
+
+    def test_reopening_state_does_not_rebuild_current_dirty_index(self):
+        db_path = os.path.join(self.root, "reopen.sqlite3")
+        initial = SyncState(db_path)
+        initial.close()
+
+        connection = sqlite3.connect(db_path)
+        authorizer_actions = []
+        connection.set_authorizer(
+            lambda action, arg1, arg2, database, trigger: (
+                authorizer_actions.append((action, arg1)) or sqlite3.SQLITE_OK
+            )
+        )
+        with patch("driver.sqlite3.connect", return_value=connection):
+            reopened = SyncState(db_path)
+        reopened.close()
+
+        self.assertNotIn(
+            (sqlite3.SQLITE_DROP_INDEX, "idx_entries_dirty"),
+            authorizer_actions,
+        )
+
+    def test_state_warns_when_wal_is_unavailable(self):
+        db_path = os.path.join(self.root, "non-wal.sqlite3")
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        execute = connection.execute
+
+        def execute_without_wal(sql, *args):
+            if sql == "PRAGMA journal_mode=WAL":
+                return Mock(fetchone=Mock(return_value=("delete",)))
+            return execute(sql, *args)
+
+        wrapped_connection = Mock(wraps=connection)
+        wrapped_connection.execute.side_effect = execute_without_wal
+        with patch("driver.sqlite3.connect", return_value=wrapped_connection):
+            with self.assertLogs("driver", level="WARNING") as logs:
+                state = SyncState(db_path)
+        state.close()
+
+        warning = "\n".join(logs.output)
+        self.assertIn(db_path, warning)
+        self.assertIn("delete", warning)
+
+    def test_state_uses_wal_and_supports_concurrent_read_only_access(self):
+        self.state.upsert_entry(
+            {
+                "path": "/visible.txt",
+                "type": "file",
+                "parent_path": "/",
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "synced_path": "/visible.txt",
+            }
+        )
+
+        journal_mode = self.state.conn.execute("PRAGMA journal_mode").fetchone()[0]
+        read_only = open_read_only(self.state.db_path)
+        try:
+            visible = read_only.execute(
+                "SELECT path FROM entries WHERE path = '/visible.txt'"
+            ).fetchone()
+        finally:
+            read_only.close()
+
+        self.assertEqual(journal_mode, "wal")
+        self.assertEqual(visible["path"], "/visible.txt")
 
 
 class SyncEngineStartupTests(unittest.TestCase):
@@ -591,9 +727,6 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             }
         )
 
-    def _pending_op_count(self):
-        return self.state.conn.execute("SELECT COUNT(*) FROM pending_ops").fetchone()[0]
-
     def test_allowed_mutations_are_accepted(self):
         self.assertEqual(self.fs.create("/allowed/queued.txt", 0o644), 0)
         self.assertEqual(self.fs.mkdir("/allowed/newdir", 0o755), 0)
@@ -606,7 +739,10 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         )
         self.assertEqual(self.fs.unlink("/allowed/newdir/renamed.txt"), 0)
         self.assertEqual(self.fs.rmdir("/allowed/newdir"), 0)
-        self.assertGreater(self._pending_op_count(), 0)
+        self.assertEqual(
+            self.state.get_entry("/allowed/queued.txt")["dirty"],
+            1,
+        )
 
     def test_atomic_file_replacement_preserves_destination_remote_identity(self):
         self._add_entry("/allowed/note.md", content=b"old")
@@ -679,7 +815,9 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         ]
 
         self.assertEqual(attempts, [-errno.EACCES] * len(attempts))
-        self.assertEqual(self._pending_op_count(), 0)
+        self.assertTrue(
+            all(entry["dirty"] == 0 for entry in self.state.list_entries())
+        )
         self.assertEqual(
             [entry["path"] for entry in self.state.list_entries()],
             entry_paths_before,

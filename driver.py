@@ -188,6 +188,22 @@ class SyncState:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        try:
+            journal_mode = self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if journal_mode.lower() != "wal":
+                logging.getLogger(__name__).warning(
+                    "SQLite database %s is using journal mode %s instead of WAL; "
+                    "concurrent read-only access may be degraded",
+                    db_path,
+                    journal_mode,
+                )
+        except sqlite3.OperationalError as exc:
+            logging.getLogger(__name__).warning(
+                "Could not enable SQLite WAL mode for %s: %s; "
+                "concurrent read-only access may be degraded",
+                db_path,
+                exc,
+            )
         self.closed = False
         self._init_db()
 
@@ -211,23 +227,19 @@ class SyncState:
                     hydrated INTEGER NOT NULL DEFAULT 0,
                     dirty INTEGER NOT NULL DEFAULT 0,
                     tombstone INTEGER NOT NULL DEFAULT 0,
+                    sync_attempt_count INTEGER NOT NULL DEFAULT 0,
+                    sync_next_attempt_at INTEGER,
+                    sync_last_error TEXT,
+                    hydrate_attempt_count INTEGER NOT NULL DEFAULT 0,
+                    hydrate_next_attempt_at INTEGER,
+                    hydrate_last_error TEXT,
+                    failed INTEGER NOT NULL DEFAULT 0,
                     local_sha256 TEXT,
                     last_synced_at INTEGER,
                     synced_path TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_entries_remote_drivewsid
                     ON entries(remote_drivewsid);
-                CREATE INDEX IF NOT EXISTS idx_entries_dirty
-                    ON entries(dirty, tombstone);
-                CREATE TABLE IF NOT EXISTS pending_ops (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    op TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    target_path TEXT,
-                    queued_at INTEGER NOT NULL,
-                    retry_count INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT
-                );
                 """
             )
             columns = {
@@ -241,6 +253,52 @@ class SyncState:
             if "remote_unified_token" not in columns:
                 self.conn.execute(
                     "ALTER TABLE entries ADD COLUMN remote_unified_token TEXT"
+                )
+            if "sync_attempt_count" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "sync_next_attempt_at" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER"
+                )
+            if "sync_last_error" not in columns:
+                self.conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+            if "hydrate_attempt_count" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "hydrate_next_attempt_at" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER"
+                )
+            if "hydrate_last_error" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT"
+                )
+            if "failed" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+                )
+            self.conn.execute("DROP TABLE IF EXISTS pending_ops")
+            dirty_index_columns = [
+                row["name"]
+                for row in self.conn.execute(
+                    "PRAGMA index_info('idx_entries_dirty')"
+                ).fetchall()
+            ]
+            if dirty_index_columns != [
+                "dirty",
+                "tombstone",
+                "failed",
+                "sync_next_attempt_at",
+            ]:
+                self.conn.execute("DROP INDEX IF EXISTS idx_entries_dirty")
+                self.conn.execute(
+                    """
+                    CREATE INDEX idx_entries_dirty
+                        ON entries(dirty, tombstone, failed, sync_next_attempt_at)
+                    """
                 )
             self.conn.commit()
 
@@ -443,19 +501,11 @@ class SyncState:
                     path,
                 ),
             )
-            self.conn.execute(
-                "DELETE FROM pending_ops WHERE path = ? OR target_path = ?",
-                (path, path),
-            )
             self.conn.commit()
 
     def remove_entry(self, path):
         with self.lock:
             self.conn.execute("DELETE FROM entries WHERE path = ?", (path,))
-            self.conn.execute(
-                "DELETE FROM pending_ops WHERE path = ? OR target_path = ?",
-                (path, path),
-            )
             self.conn.commit()
 
     def remove_subtree(self, path):
@@ -464,10 +514,6 @@ class SyncState:
             self.conn.execute(
                 "DELETE FROM entries WHERE path = ? OR path LIKE ?",
                 (path, prefix + "%"),
-            )
-            self.conn.execute(
-                "DELETE FROM pending_ops WHERE path = ? OR path LIKE ? OR target_path = ? OR target_path LIKE ?",
-                (path, prefix + "%", path, prefix + "%"),
             )
             self.conn.commit()
 
@@ -489,19 +535,6 @@ class SyncState:
                 self.conn.execute(
                     "DELETE FROM entries WHERE path = ? OR path LIKE ?",
                     (newpath, destination_prefix + "%"),
-                )
-                self.conn.execute(
-                    """
-                    DELETE FROM pending_ops
-                    WHERE path = ? OR path LIKE ?
-                       OR target_path = ? OR target_path LIKE ?
-                    """,
-                    (
-                        newpath,
-                        destination_prefix + "%",
-                        newpath,
-                        destination_prefix + "%",
-                    ),
                 )
             for entry in entries:
                 current = entry["path"]
@@ -564,33 +597,6 @@ class SyncState:
                         newpath,
                     ),
                 )
-            self.conn.execute(
-                """
-                UPDATE pending_ops
-                SET path = CASE
-                    WHEN path = ? THEN ?
-                    WHEN path LIKE ? THEN ? || substr(path, ?)
-                    ELSE path
-                END,
-                target_path = CASE
-                    WHEN target_path = ? THEN ?
-                    WHEN target_path LIKE ? THEN ? || substr(target_path, ?)
-                    ELSE target_path
-                END
-                """,
-                (
-                    oldpath,
-                    newpath,
-                    prefix + "%",
-                    newpath.rstrip("/") + "/",
-                    len(prefix) + 1,
-                    oldpath,
-                    newpath,
-                    prefix + "%",
-                    newpath.rstrip("/") + "/",
-                    len(prefix) + 1,
-                ),
-            )
             self.conn.commit()
 
     def mark_synced_subtree(self, path):
@@ -665,27 +671,6 @@ class SyncState:
                 WHERE path = ?
                 """,
                 (path,),
-            )
-            self.conn.commit()
-
-    def queue_op(self, op, path, target_path=None):
-        now = int(time.time())
-        with self.lock:
-            if op == "delete":
-                existing_create = self.conn.execute(
-                    "SELECT id FROM pending_ops WHERE path = ? AND op IN ('create', 'mkdir')",
-                    (path,),
-                ).fetchone()
-                if existing_create:
-                    self.conn.execute("DELETE FROM pending_ops WHERE path = ?", (path,))
-                    self.conn.commit()
-                    return
-            self.conn.execute(
-                """
-                INSERT INTO pending_ops (op, path, target_path, queued_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (op, path, target_path, now),
             )
             self.conn.commit()
 
@@ -1326,9 +1311,6 @@ class ICloudSyncEngine:
         if self.mirror.exists(entry["path"]):
             self.mirror.rename_path(entry["path"], conflict_path)
         self.state.detach_subtree_as_conflict(entry["path"], conflict_path)
-        subtree = self.state._fetch_subtree(conflict_path)
-        for child in subtree:
-            self.state.queue_op("conflict-copy", child["path"])
 
     def _schedule_all_unhydrated(self):
         paths = self.state.list_unhydrated_paths()
@@ -2318,7 +2300,6 @@ class ICloudFS(Fuse):
                     "synced_path": None,
                 }
             )
-            self.state.queue_op("create", path)
             self._log_file_op("create", path, mode=oct(mode), flags=flags)
             return 0
         except Exception as exc:
@@ -2379,7 +2360,6 @@ class ICloudFS(Fuse):
                 )
             else:
                 self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
-            self.state.queue_op("update", path)
             self._log_file_op("write", path, size=len(buf), offset=offset, written=written)
             return written
         except Exception as exc:
@@ -2413,7 +2393,6 @@ class ICloudFS(Fuse):
                     "synced_path": None,
                 }
             )
-            self.state.queue_op("mkdir", path)
             self._log_file_op("mkdir", path, mode=oct(mode))
             return 0
         except Exception as exc:
@@ -2433,7 +2412,6 @@ class ICloudFS(Fuse):
             self.mirror.remove_dir(path)
             if entry["remote_drivewsid"]:
                 self.state.mark_tombstone(path)
-                self.state.queue_op("delete", path)
             else:
                 self.state.remove_subtree(path)
             self._log_file_op("rmdir", path)
@@ -2458,7 +2436,6 @@ class ICloudFS(Fuse):
                 self.mirror.remove_file(path)
             if entry["remote_drivewsid"]:
                 self.state.mark_tombstone(path)
-                self.state.queue_op("delete", path)
             else:
                 self.state.remove_entry(path)
             self._log_file_op("unlink", path)
@@ -2499,7 +2476,6 @@ class ICloudFS(Fuse):
                 root_dirty=True,
                 replace_entry=existing,
             )
-            self.state.queue_op("rename", oldpath, newpath)
             self._log_file_op("rename", oldpath, target_path=newpath)
             return 0
         except OSError as exc:
@@ -2545,7 +2521,6 @@ class ICloudFS(Fuse):
                 )
             else:
                 self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
-            self.state.queue_op("update", path)
             self._log_file_op("truncate", path, length=length)
             return 0
         except Exception as exc:
