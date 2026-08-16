@@ -2,6 +2,7 @@
 """Report the local iCloud sync queue without changing its state."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -14,6 +15,7 @@ import yaml
 MISSING_PATH_LIMIT = 50
 MAX_SYNC_ATTEMPTS = 8
 ERROR_DISPLAY_LIMIT = 200
+UNRECORDED_FAILURES_FILENAME = "unrecorded_failures.log"
 
 
 def load_config(config_path):
@@ -47,9 +49,42 @@ def _count(conn, query):
     return conn.execute(query).fetchone()[0]
 
 
+def read_unrecorded_failures(cache_dir):
+    """Read valid fallback failure records without modifying their log."""
+    marker_path = os.path.join(cache_dir, UNRECORDED_FAILURES_FILENAME)
+    try:
+        with open(marker_path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+
+    failures = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            continue
+        failures.append(
+            {
+                "path": record["path"],
+                "operation": record.get("operation", "hydration"),
+                "error": record.get("error"),
+                "record_error": record.get("record_error"),
+            }
+        )
+    return failures
+
+
 def inspect_queue(db_path, mirror_root, now=None):
     """Collect queue diagnostics from an already-existing read-only database."""
     now = time.time() if now is None else now
+    unrecorded_failures = read_unrecorded_failures(
+        os.path.dirname(os.path.abspath(db_path))
+    )
     conn = open_read_only(db_path)
     try:
         tables = {
@@ -59,12 +94,19 @@ def inspect_queue(db_path, mirror_root, now=None):
             )
         }
         if "entries" not in tables:
-            return {"schema_error": "entries table is missing"}
+            return {
+                "schema_error": "entries table is missing",
+                "unrecorded_failures": unrecorded_failures,
+            }
 
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(entries)")
         }
-        report = {"columns": columns, "total": _count(conn, "SELECT COUNT(*) FROM entries")}
+        report = {
+            "columns": columns,
+            "total": _count(conn, "SELECT COUNT(*) FROM entries"),
+            "unrecorded_failures": unrecorded_failures,
+        }
 
         if "type" in columns:
             report["by_type"] = {
@@ -360,7 +402,11 @@ def format_due(timestamp, now=None):
 
 def queue_summary(report):
     if "schema_error" in report:
-        return f"Queue: unavailable ({report['schema_error']})"
+        summary = f"Queue: unavailable ({report['schema_error']})"
+        unrecorded_failures = report.get("unrecorded_failures", [])
+        if unrecorded_failures:
+            summary += f", {len(unrecorded_failures)} unrecorded-failures"
+        return summary
     pending = report.get("pending_retries")
     pending_sync = report.get("pending_sync_entries")
     pending_hydration = report.get("pending_hydration_retries")
@@ -375,8 +421,12 @@ def queue_summary(report):
         or quarantined is None
         or hydrate_exhausted is None
     ):
-        return "Queue: unavailable (durable queue schema is incomplete)"
-    return (
+        summary = "Queue: unavailable (durable queue schema is incomplete)"
+        unrecorded_failures = report.get("unrecorded_failures", [])
+        if unrecorded_failures:
+            summary += f", {len(unrecorded_failures)} unrecorded-failures"
+        return summary
+    summary = (
         f"Queue: {len(pending_sync)} sync-ready, "
         f"{len(pending)} sync-pending, "
         f"{len(pending_hydration)} hydrate-pending, "
@@ -384,6 +434,10 @@ def queue_summary(report):
         f"{len(quarantined)} quarantined, "
         f"{len(hydrate_exhausted)} hydrate-failed"
     )
+    unrecorded_failures = report.get("unrecorded_failures", [])
+    if unrecorded_failures:
+        summary += f", {len(unrecorded_failures)} unrecorded-failures"
+    return summary
 
 
 def print_report(config_path, cache_dir, db_path, mirror_root, report):
@@ -396,6 +450,7 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
 
     if "schema_error" in report:
         print(f"WARNING: {report['schema_error']}; no queue statistics available.")
+        _print_unrecorded_failures(report["unrecorded_failures"])
         return
 
     print("Entries:")
@@ -498,6 +553,10 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
             )
         print()
 
+    unrecorded_failures = report["unrecorded_failures"]
+    if unrecorded_failures:
+        _print_unrecorded_failures(unrecorded_failures)
+
     pending_tombstones = report["pending_tombstones"]
     if pending_tombstones:
         print(f"Tombstones awaiting remote deletion ({len(pending_tombstones)}):")
@@ -531,6 +590,7 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
         and not auth_blocked_entries
         and not quarantined_entries
         and not hydrate_exhausted
+        and not unrecorded_failures
         and not pending_tombstones
         and not missing
     ):
@@ -538,6 +598,31 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
             "Queue recovery: no pending retries, quarantined sync entries, "
             "exhausted hydration, or remote deletions."
         )
+
+
+def _print_unrecorded_failures(unrecorded_failures):
+    if not unrecorded_failures:
+        return
+    print(
+        "Unrecorded foreground hydration failures "
+        f"({len(unrecorded_failures)}):"
+    )
+    print(
+        "  WARNING: the driver could not persist these hydration failures; "
+        "the queue may be INCOMPLETE and these files may be stuck without "
+        "appearing in the normal categories."
+    )
+    for failure in unrecorded_failures:
+        print(
+            f"  {failure['path']} ({failure['operation']}): "
+            f"{_truncate_error(failure['error'])}"
+        )
+        print(
+            "    Remedy: resolve the error, then run: "
+            f"./icloudctl retry '{failure['path']}'"
+        )
+        print("    That clears this fallback marker after resetting queue state.")
+    print()
 
 
 def main(argv=None):

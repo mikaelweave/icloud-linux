@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -76,6 +77,14 @@ class QueueDiagnosticTests(unittest.TestCase):
             result = queue_diagnostic.main(["--config", self.config_path])
         return result, output.getvalue()
 
+    def run_queue_summary(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = queue_diagnostic.main(
+                ["--config", self.config_path, "--summary"]
+            )
+        return result, output.getvalue()
+
     def test_reports_clean_database(self):
         conn = self.create_db()
         self.add_entry(conn, "/documents", entry_type="folder")
@@ -97,6 +106,74 @@ class QueueDiagnosticTests(unittest.TestCase):
             "Queue recovery: no pending retries, quarantined sync entries, "
             "exhausted hydration, or remote deletions.",
             output,
+        )
+
+    def test_reports_unrecorded_fallback_failure_and_summary_count(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
+        conn.commit()
+        conn.close()
+        with open(
+            os.path.join(self.cache_dir, "unrecorded_failures.log"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(
+                '{"timestamp": 1, "path": "/only-in-marker.txt", '
+                '"operation": "open", "error": "offline", '
+                '"record_error": "database is locked"}\n'
+            )
+
+        result, output = self.run_queue()
+        summary_result, summary = self.run_queue_summary()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(summary_result, 0)
+        self.assertIn("Unrecorded foreground hydration failures (1):", output)
+        self.assertIn("/only-in-marker.txt", output)
+        self.assertIn("queue may be INCOMPLETE", output)
+        self.assertIn("1 unrecorded-failures", summary)
+
+    def test_summary_is_unchanged_without_unrecorded_failure_marker(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
+        conn.commit()
+        conn.close()
+
+        report = queue_diagnostic.inspect_queue(self.db_path, self.mirror_dir)
+        result, output = self.run_queue_summary()
+
+        self.assertIn("unrecorded_failures", report)
+        self.assertEqual(report["unrecorded_failures"], [])
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output,
+            "Queue: 0 sync-ready, 0 sync-pending, 0 hydrate-pending, "
+            "0 authentication-blocked, 0 quarantined, 0 hydrate-failed\n",
         )
 
     def test_reports_dirty_files_missing_from_mirror(self):
@@ -354,6 +431,34 @@ class QueueDiagnosticTests(unittest.TestCase):
             unittest.mock.call("PRAGMA busy_timeout = 30000"),
             wrapped_connection.execute.call_args_list,
         )
+    def test_retry_clears_marker_when_no_queue_entry_exists(self):
+        """Markers exist because the DB write failed, so retry must not
+        depend on a matching row to clear them."""
+        conn = self.create_db()
+        conn.commit()
+        conn.close()
+        marker_path = os.path.join(
+            os.path.dirname(self.db_path),
+            queue_recovery.UNRECORDED_FAILURES_FILENAME,
+        )
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"path": "/ghost.txt", "operation": "open"}) + "\n"
+            )
+            handle.write(
+                json.dumps({"path": "/keep.txt", "operation": "read"}) + "\n"
+            )
+
+        cleared, path, markers_cleared = queue_recovery.clear_failures(
+            self.db_path, "/ghost.txt"
+        )
+
+        self.assertEqual(cleared, 0)
+        self.assertEqual(path, "/ghost.txt")
+        self.assertEqual(markers_cleared, 1)
+        with open(marker_path, encoding="utf-8") as handle:
+            remaining = [json.loads(line)["path"] for line in handle if line.strip()]
+        self.assertEqual(remaining, ["/keep.txt"])
 
 
 if __name__ == "__main__":

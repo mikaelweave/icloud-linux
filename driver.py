@@ -2697,6 +2697,9 @@ class ICloudFS(Fuse):
                 exc,
                 record_exc,
             )
+            self._write_unrecorded_hydration_failure_marker(
+                path, exc, operation, record_exc
+            )
             return
         self.logger.error(
             "Failed hydrating on %s for %s: %s; "
@@ -2708,6 +2711,29 @@ class ICloudFS(Fuse):
             attempt,
             exhausted,
         )
+
+    def _write_unrecorded_hydration_failure_marker(
+        self, path, exc, operation, record_exc
+    ):
+        try:
+            marker_path = os.path.join(
+                self.cache_dir, "unrecorded_failures.log"
+            )
+            record = {
+                "timestamp": int(time.time()),
+                "path": path,
+                "operation": operation,
+                "error": str(exc),
+                "record_error": str(record_exc),
+            }
+            with open(marker_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception as marker_exc:
+            self.logger.error(
+                "Failed writing unrecorded hydration failure marker for %s: %s",
+                path,
+                marker_exc,
+            )
 
     def _mutation_allowed(self, operation, *paths):
         if self.sync_engine is None:

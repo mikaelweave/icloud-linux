@@ -2,6 +2,7 @@
 """Clear durable queue retry state through a bounded SQLite write."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -11,6 +12,7 @@ import yaml
 
 
 WRITE_TIMEOUT_SECONDS = 30
+UNRECORDED_FAILURES_FILENAME = "unrecorded_failures.log"
 
 
 def normalize_path(path):
@@ -34,6 +36,68 @@ def subtree_where(path):
     return "path = ? OR path LIKE ? ESCAPE '\\'", (path, escaped_path + "/%")
 
 
+def path_in_subtree(candidate, path):
+    """Match the same subtree semantics the SQL update uses."""
+    if path is None:
+        return True
+    if not isinstance(candidate, str):
+        return False
+    return candidate == path or candidate.startswith(path.rstrip("/") + "/")
+
+
+def clear_unrecorded_failure_markers(cache_dir, path):
+    """Remove fallback records the user explicitly asked to retry.
+
+    Markers exist precisely because the database write failed, so they cannot
+    be keyed off rows that were reset: the retried entry may carry no failure
+    state, or no row at all. Explicit user intent clears them, matching how
+    the driver treats other deliberate recovery actions.
+    """
+    marker_path = os.path.join(cache_dir, UNRECORDED_FAILURES_FILENAME)
+    try:
+        with open(marker_path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        print(
+            f"WARNING: queue state was reset but fallback markers remain: {exc}",
+            file=sys.stderr,
+        )
+        return 0
+
+    remaining_lines = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            remaining_lines.append(line)
+            continue
+        if not isinstance(record, dict) or not path_in_subtree(
+            record.get("path"), path
+        ):
+            remaining_lines.append(line)
+
+    if len(remaining_lines) == len(lines):
+        return 0
+    removed = len(lines) - len(remaining_lines)
+    try:
+        if remaining_lines:
+            replacement_path = marker_path + ".retry"
+            with open(replacement_path, "w", encoding="utf-8") as handle:
+                handle.writelines(remaining_lines)
+            os.replace(replacement_path, marker_path)
+        else:
+            os.remove(marker_path)
+    except OSError as exc:
+        print(
+            f"WARNING: queue state was reset but fallback markers remain: {exc}",
+            file=sys.stderr,
+        )
+        return 0
+    return removed
+
+
 def clear_failures(db_path, path=None):
     """Clear sync and hydration retry state for a path subtree in one update."""
     if path is not None:
@@ -53,7 +117,10 @@ def clear_failures(db_path, path=None):
             ).fetchone()
             if exists is None:
                 conn.rollback()
-                return 0, path
+                markers_cleared = clear_unrecorded_failure_markers(
+                    os.path.dirname(os.path.abspath(db_path)), path
+                )
+                return 0, path, markers_cleared
         cursor = conn.execute(
             """
             UPDATE entries
@@ -68,7 +135,10 @@ def clear_failures(db_path, path=None):
             parameters,
         )
         conn.commit()
-        return cursor.rowcount, path
+        markers_cleared = clear_unrecorded_failure_markers(
+            os.path.dirname(os.path.abspath(db_path)), path
+        )
+        return cursor.rowcount, path, markers_cleared
     except Exception:
         conn.rollback()
         raise
@@ -106,7 +176,7 @@ def main(argv=None):
     )
     db_path = os.path.join(cache_dir, "state.sqlite3")
     try:
-        cleared, path = clear_failures(db_path, args.path)
+        cleared, path, markers_cleared = clear_failures(db_path, args.path)
     except FileNotFoundError:
         print(f"ERROR: state DB not found: {db_path}", file=sys.stderr)
         return 1
@@ -119,6 +189,12 @@ def main(argv=None):
         return 1
 
     if args.path is not None and not cleared:
+        if markers_cleared:
+            print(
+                f"Cleared {markers_cleared} unrecorded failure marker(s) for "
+                f"{path}; no queue entry needed resetting."
+            )
+            return 0
         print(f"ERROR: queue path not found: {path}", file=sys.stderr)
         return 1
     if path is None:
@@ -128,6 +204,8 @@ def main(argv=None):
             f"Cleared retry and quarantine state for {cleared} "
             f"entries under {path}."
         )
+    if markers_cleared:
+        print(f"Also cleared {markers_cleared} unrecorded failure marker(s).")
     return 0
 
 

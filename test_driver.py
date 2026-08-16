@@ -2135,18 +2135,26 @@ class DurableHydrationQueueTests(unittest.TestCase):
         self.engine._schedule_download_with_delay.assert_not_called()
 
     def test_recovery_reschedules_auth_blocked_hydration(self):
-        self._add_unhydrated_entry("/queued.txt")
+        path = "/queued.txt"
+        self._add_unhydrated_entry(path)
         self.engine.ensure_local_file = Mock(
             side_effect=PyiCloudFailedLoginException("expired session")
         )
         self.engine.scheduled_downloads.add("/queued.txt")
         self.engine._download_job("/queued.txt")
         self.engine._schedule_download = Mock()
+        marker_path = os.path.join(self.root, "unrecorded_failures.log")
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                '{"timestamp": 1, "path": "/queued.txt", "operation": "open", '
+                '"error": "offline", "record_error": "database is locked"}\n'
+            )
 
-        cleared, path = queue_recovery.clear_failures(self.state.db_path)
+        cleared, path, _markers = queue_recovery.clear_failures(self.state.db_path)
         self.engine._schedule_all_unhydrated()
 
         self.assertEqual((cleared, path), (1, None))
+        self.assertFalse(os.path.exists(marker_path))
         self.assertIsNone(
             self.state.get_entry("/queued.txt")["hydrate_next_attempt_at"]
         )
@@ -2207,6 +2215,7 @@ class HydrationFailureFUSETests(unittest.TestCase):
         self.fs.mirror = self.mirror
         self.fs.state = self.state
         self.fs.sync_engine = self.engine
+        self.fs.cache_dir = self.root
         self.fs.file_mode = 0o644
         self.fs.dir_mode = 0o755
         self.fs.mount_uid = os.getuid()
@@ -2334,6 +2343,63 @@ class HydrationFailureFUSETests(unittest.TestCase):
             [path],
         )
         self.assertIn("1 hydrate-pending", queue_diagnostic.queue_summary(report))
+
+    def test_open_hydration_recording_failure_writes_fallback_marker(self):
+        path = "/unrecorded.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-unrecorded",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.fs._is_authenticated = Mock(return_value=True)
+        self.engine.ensure_local_file = Mock(side_effect=Timeout("offline"))
+        self.engine._record_hydrate_failure = Mock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+
+        self.assertEqual(self.fs.open(path, os.O_RDONLY), -errno.EIO)
+        marker_path = os.path.join(self.root, "unrecorded_failures.log")
+        self.assertTrue(os.path.exists(marker_path))
+        with open(marker_path, encoding="utf-8") as handle:
+            marker = handle.read()
+        self.assertIn(path, marker)
+        self.assertIn("open", marker)
+
+    def test_open_hydration_recording_marker_write_failure_returns_eio(self):
+        path = "/marker-write-failure.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-marker-write-failure",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.fs._is_authenticated = Mock(return_value=True)
+        self.engine.ensure_local_file = Mock(side_effect=Timeout("offline"))
+        self.engine._record_hydrate_failure = Mock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            self.assertEqual(self.fs.open(path, os.O_RDONLY), -errno.EIO)
+
+        self.assertGreaterEqual(self.fs.logger.error.call_count, 2)
 
     def test_open_auth_hydration_failure_is_queue_blocked_without_attempt(self):
         path = "/expired-session.txt"
