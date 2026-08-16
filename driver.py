@@ -45,6 +45,53 @@ DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
 DEFAULT_FILE_MODE = 0o644
 DEFAULT_DIR_MODE = 0o755
+SYNC_FAILURE_AUTH = "auth"
+SYNC_FAILURE_TERMINAL = "terminal"
+SYNC_FAILURE_TRANSIENT = "transient"
+AUTH_ERROR_TYPES = (
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+)
+
+
+def _http_status_from_exception(exc):
+    try:
+        response = getattr(exc, "response", None)
+    except Exception:
+        response = None
+    if response is not None:
+        try:
+            status = getattr(response, "status_code", None)
+        except Exception:
+            status = None
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    if isinstance(exc, PyiCloudAPIResponseException):
+        for attribute in ("code", "status"):
+            try:
+                status = getattr(exc, attribute, None)
+            except Exception:
+                continue
+            if isinstance(status, int) and not isinstance(status, bool):
+                return status
+    return None
+
+
+def classify_sync_failure(exc, operation):
+    """Classify a failed sync operation for the durable sync queue."""
+    if isinstance(exc, AUTH_ERROR_TYPES):
+        return SYNC_FAILURE_AUTH
+
+    # Conservative allow-list: only conditions we can prove are permanent are
+    # terminal. pyicloud raises a typed auth exception only for HTTP 450, so a
+    # bare 403 may be an expired session rather than a real permission denial;
+    # retrying it costs bounded latency, while quarantining it needs a human.
+    status = _http_status_from_exception(exc)
+    if status == 404 and operation == "delete":
+        return SYNC_FAILURE_TERMINAL
+    return SYNC_FAILURE_TRANSIENT
 
 
 def normalize_icloud_path(path):
@@ -1377,17 +1424,7 @@ class ICloudSyncEngine:
         return min(300, 5 * (2 ** max(0, attempt - 1)))
 
     def _is_auth_error(self, exc):
-        if isinstance(
-            exc,
-            (
-                PyiCloud2FARequiredException,
-                PyiCloud2SARequiredException,
-                PyiCloudAuthRequiredException,
-                PyiCloudFailedLoginException,
-            ),
-        ):
-            return True
-        return False
+        return classify_sync_failure(exc, None) == SYNC_FAILURE_AUTH
 
     def _download_job(self, path):
         retry_delay = None

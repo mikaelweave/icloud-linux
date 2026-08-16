@@ -3,14 +3,32 @@ import io
 import os
 import shutil
 import sqlite3
+import socket
 import stat
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from requests.exceptions import Timeout
 from requests.models import RequestEncodingMixin
 
-from driver import ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
-from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
+from driver import (
+    ICloudFS,
+    ICloudSyncEngine,
+    LocalMirror,
+    NamedFileStream,
+    SYNC_FAILURE_AUTH,
+    SYNC_FAILURE_TERMINAL,
+    SYNC_FAILURE_TRANSIENT,
+    SyncState,
+    classify_sync_failure,
+)
+from pyicloud.exceptions import (
+    PyiCloud2FARequiredException,
+    PyiCloud2SARequiredException,
+    PyiCloudAPIResponseException,
+    PyiCloudAuthRequiredException,
+    PyiCloudFailedLoginException,
+)
 from queue_diagnostic import open_read_only
 
 
@@ -403,6 +421,89 @@ class DriverStateTests(unittest.TestCase):
 
         self.assertEqual(journal_mode, "wal")
         self.assertEqual(visible["path"], "/visible.txt")
+
+
+class SyncFailureClassificationTests(unittest.TestCase):
+    def test_auth_exceptions_classify_as_auth(self):
+        response = Mock()
+        exceptions = (
+            PyiCloud2FARequiredException("user@example.com", response),
+            PyiCloud2SARequiredException("user@example.com"),
+            PyiCloudAuthRequiredException("user@example.com", response),
+            PyiCloudFailedLoginException("bad session"),
+        )
+
+        for exc in exceptions:
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(
+                    classify_sync_failure(exc, "download"),
+                    SYNC_FAILURE_AUTH,
+                )
+
+    def test_not_found_delete_classifies_as_terminal(self):
+        exc = PyiCloudAPIResponseException("not found", 404)
+
+        self.assertEqual(
+            classify_sync_failure(exc, "delete"),
+            SYNC_FAILURE_TERMINAL,
+        )
+
+    def test_not_found_upload_classifies_as_transient(self):
+        exc = PyiCloudAPIResponseException("not found", 404)
+
+        self.assertEqual(
+            classify_sync_failure(exc, "upload"),
+            SYNC_FAILURE_TRANSIENT,
+        )
+
+    def test_forbidden_classifies_as_transient(self):
+        # pyicloud only raises a typed auth exception for HTTP 450, so an
+        # expired session can surface as a bare 403. Retry rather than
+        # quarantine; a genuine denial still quarantines once retries run out.
+        response = Mock(status_code=403, text="")
+        exc = PyiCloudAPIResponseException("forbidden", response=response)
+
+        self.assertEqual(
+            classify_sync_failure(exc, "download"),
+            SYNC_FAILURE_TRANSIENT,
+        )
+
+    def test_generic_500_auth_message_classifies_as_transient(self):
+        exc = PyiCloudAPIResponseException(
+            "Authentication required for Account.",
+            500,
+        )
+
+        self.assertEqual(
+            classify_sync_failure(exc, "download"),
+            SYNC_FAILURE_TRANSIENT,
+        )
+
+    def test_rate_limit_classifies_as_transient(self):
+        exc = PyiCloudAPIResponseException("rate limited", 429)
+
+        self.assertEqual(
+            classify_sync_failure(exc, "upload"),
+            SYNC_FAILURE_TRANSIENT,
+        )
+
+    def test_unrecognized_and_malformed_exceptions_classify_as_transient(self):
+        malformed_response = RuntimeError("bad response")
+        malformed_response.response = object()
+        exceptions = (
+            RuntimeError("network failure"),
+            socket.timeout("timed out"),
+            Timeout("request timed out"),
+            malformed_response,
+            PyiCloudAPIResponseException("forbidden", "403"),
+        )
+
+        for exc in exceptions:
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(
+                    classify_sync_failure(exc, "download"),
+                    SYNC_FAILURE_TRANSIENT,
+                )
 
 
 class SyncEngineStartupTests(unittest.TestCase):
