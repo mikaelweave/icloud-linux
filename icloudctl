@@ -184,6 +184,10 @@ cmd_auth() {
   ensure_venv
   create_config_if_missing
   "$REPO_DIR/.venv/bin/python" "$REPO_DIR/auth.py" "$CONFIG_FILE" "$@"
+  if systemctl --user is-active --quiet icloud.service; then
+    systemctl --user restart icloud.service
+    echo "Reloaded icloud.service with the renewed authentication session."
+  fi
 }
 
 cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
@@ -211,6 +215,13 @@ cmd_queue() {
 cmd_retry() {
   ensure_venv
   "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_recovery.py" --config "$CONFIG_FILE" "$@"
+  if systemctl --user is-active --quiet icloud.service; then
+    if systemctl --user kill --kill-whom=main --signal=SIGUSR1 icloud.service; then
+      echo "Requested the running service to reschedule recovered entries."
+    else
+      echo "WARNING: retry state was cleared, but could not notify icloud.service." >&2
+    fi
+  fi
 }
 
 cmd_sync() {

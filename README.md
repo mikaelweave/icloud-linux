@@ -177,8 +177,9 @@ If Apple expires your session, run:
 
 ```bash
 ./icloudctl auth
-./icloudctl restart
 ```
+
+When the service is running, `auth` reloads it with the renewed session.
 
 ### iOS 26 Beta 2FA Workaround
 
@@ -221,10 +222,12 @@ What they do:
 - `status`: shows whether the service is running and a one-line durable queue summary
 - `logs`: tails the service logs
 - `doctor`: checks common setup issues
-- `queue`: read-only report of pending retries, sync quarantine, exhausted
-  hydration, and tombstones awaiting remote deletion
+- `queue`: read-only report of pending sync and hydration retries, entries
+  waiting for authentication, sync quarantine, exhausted hydration, and
+  tombstones awaiting remote deletion
 - `retry [path]`: clears sync and hydration retry state for every entry, or
-  recursively for a path and its descendants after you resolve the cause
+  recursively for a path and its descendants after you resolve the cause; it
+  also asks a running service to reschedule the recovered entries
 - `hydrate`: blocks until all eligible files (per `sync_paths` / `exclude_paths`) are fully downloaded locally. Use this before copying files to ensure nothing triggers a mid-copy download. `--dry-run` shows what would be downloaded without actually downloading.
 - `sync`: triggers an on-demand remote metadata sync in the running driver
   (sends SIGUSR1, waits for completion). It bypasses retry backoff for this

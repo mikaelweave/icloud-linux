@@ -8,6 +8,7 @@ import time
 import unittest
 
 import queue_diagnostic
+import queue_recovery
 
 
 ENTRY_SCHEMA = """
@@ -138,6 +139,7 @@ class QueueDiagnosticTests(unittest.TestCase):
         conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
         conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
         self.add_entry(conn, "/retry.txt", dirty=1)
+        self.add_entry(conn, "/ready.txt", dirty=1)
         self.add_entry(conn, "/quarantined.txt", dirty=1)
         self.add_entry(conn, "/hydrate.txt")
         self.add_entry(conn, "/deleted.txt", dirty=1, tombstone=1)
@@ -178,6 +180,8 @@ class QueueDiagnosticTests(unittest.TestCase):
             output,
         )
         self.assertIn("temporary outage", output)
+        self.assertIn("Pending sync entries (1):", output)
+        self.assertIn("/ready.txt", output)
         self.assertIn("Sync quarantine — manual action required (1):", output)
         self.assertIn(
             "/quarantined.txt (attempt 8): Mirror file is missing",
@@ -191,6 +195,67 @@ class QueueDiagnosticTests(unittest.TestCase):
         )
         self.assertIn("Tombstones awaiting remote deletion (1):", output)
         self.assertIn("/deleted.txt", output)
+
+    def test_reports_auth_blocked_and_pending_hydration_entries(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
+        self.add_entry(conn, "/auth-upload.txt", dirty=1)
+        self.add_entry(conn, "/auth-download.txt", hydrated=0)
+        self.add_entry(conn, "/download-retry.txt", hydrated=0)
+        next_attempt = int(time.time()) + 60
+        conn.execute(
+            """
+            UPDATE entries
+            SET sync_next_attempt_at = ?, sync_last_error = ?
+            WHERE path = ?
+            """,
+            (next_attempt, "expired session", "/auth-upload.txt"),
+        )
+        conn.execute(
+            """
+            UPDATE entries
+            SET hydrate_next_attempt_at = ?, hydrate_last_error = ?
+            WHERE path = ?
+            """,
+            (next_attempt, "expired session", "/auth-download.txt"),
+        )
+        conn.execute(
+            """
+            UPDATE entries
+            SET hydrate_attempt_count = 2, hydrate_next_attempt_at = ?,
+                hydrate_last_error = ?
+            WHERE path = ?
+            """,
+            (next_attempt, "temporary download outage", "/download-retry.txt"),
+        )
+        conn.commit()
+        conn.close()
+
+        result, output = self.run_queue()
+
+        self.assertEqual(result, 0)
+        self.assertIn("Waiting for authentication (2):", output)
+        self.assertIn("/auth-upload.txt (sync): expired session", output)
+        self.assertIn("/auth-download.txt (hydration): expired session", output)
+        self.assertIn("Remedy: run './icloudctl auth'", output)
+        self.assertIn("Pending hydration retries (1):", output)
+        self.assertIn(
+            "/download-retry.txt (attempt 2; due ",
+            output,
+        )
+        self.assertIn("temporary download outage", output)
 
     def test_reports_missing_app_library_as_at_risk(self):
         conn = self.create_db()
@@ -258,6 +323,37 @@ class QueueDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn("entries table is missing", output)
+
+    def test_recovery_sets_generous_busy_timeout(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
+        conn.commit()
+        conn.close()
+        connection = sqlite3.connect(self.db_path)
+        wrapped_connection = unittest.mock.Mock(wraps=connection)
+
+        with unittest.mock.patch(
+            "queue_recovery.sqlite3.connect",
+            return_value=wrapped_connection,
+        ):
+            queue_recovery.clear_failures(self.db_path)
+
+        self.assertIn(
+            unittest.mock.call("PRAGMA busy_timeout = 30000"),
+            wrapped_connection.execute.call_args_list,
+        )
 
 
 if __name__ == "__main__":

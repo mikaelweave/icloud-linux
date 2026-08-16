@@ -37,6 +37,7 @@ from pyicloud.exceptions import (
     PyiCloudFailedLoginException,
 )
 from queue_diagnostic import open_read_only
+import queue_recovery
 
 
 class NoUnboundedReadStream(io.BytesIO):
@@ -428,6 +429,11 @@ class DriverStateTests(unittest.TestCase):
 
         self.assertEqual(journal_mode, "wal")
         self.assertEqual(visible["path"], "/visible.txt")
+
+    def test_state_sets_generous_busy_timeout(self):
+        timeout = self.state.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+        self.assertEqual(timeout, 30000)
 
 
 class SyncFailureClassificationTests(unittest.TestCase):
@@ -1022,6 +1028,29 @@ class DurableSyncQueueTests(unittest.TestCase):
         entry = self.state.get_entry("/queued.txt")
         self.assertEqual(entry["sync_attempt_count"], 0)
         self.assertIsNotNone(entry["sync_next_attempt_at"])
+        self.assertEqual(entry["sync_last_error"], "expired session")
+
+    def test_restart_preserves_auth_sync_deferral(self):
+        self.mirror.write("/queued.txt", b"content", 0)
+        self._add_entry("/queued.txt")
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+
+        self.engine._sync_file(self.state.get_entry("/queued.txt"))
+        original_deadline = self.state.get_entry("/queued.txt")[
+            "sync_next_attempt_at"
+        ]
+        self.state.close()
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertEqual(entry["sync_last_error"], "expired session")
+        self.assertEqual(entry["sync_next_attempt_at"], original_deadline)
 
     def test_delete_not_found_resolves_tombstone_without_quarantine(self):
         self._add_entry("/removed", entry_type="folder", remote_drivewsid="folder-1")
@@ -1385,6 +1414,22 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             1,
         )
 
+    def test_write_returns_eio_when_mark_dirty_fails_after_mirror_write(self):
+        self._add_entry("/allowed/file.txt")
+        self.state.mark_dirty = Mock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
+
+        result = self.fs.write("/allowed/file.txt", b"changed", 0)
+
+        self.assertEqual(result, -errno.EIO)
+        self.assertEqual(
+            self.mirror.read("/allowed/file.txt", 100, 0),
+            b"changedg",
+        )
+        self.assertEqual(self.state.get_entry("/allowed/file.txt")["dirty"], 0)
+        self.fs.logger.error.assert_called_once()
+
     def test_unlink_of_missing_mirror_file_recovers_quarantined_tombstone(self):
         self._add_entry("/allowed/removed.txt")
         self.mirror.remove_file("/allowed/removed.txt")
@@ -1602,6 +1647,24 @@ class DurableHydrationQueueTests(unittest.TestCase):
         self.assertEqual(entry["hydrate_last_error"], "temporary outage")
         self.assertIsNone(entry["hydrate_next_attempt_at"])
 
+    def test_restart_preserves_auth_hydration_deferral(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+        self.engine.scheduled_downloads.add("/queued.txt")
+        self.engine._download_job("/queued.txt")
+        original_deadline = self.state.get_entry("/queued.txt")[
+            "hydrate_next_attempt_at"
+        ]
+        self.state.close()
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+
+        entry = self.state.get_entry("/queued.txt")
+        self.assertEqual(entry["hydrate_attempt_count"], 0)
+        self.assertEqual(entry["hydrate_last_error"], "expired session")
+        self.assertEqual(entry["hydrate_next_attempt_at"], original_deadline)
+
     def test_hydration_exhaustion_stops_retry_scheduling(self):
         self._add_unhydrated_entry("/queued.txt")
         self.engine.ensure_local_file = Mock(side_effect=Timeout("timed out"))
@@ -1653,7 +1716,26 @@ class DurableHydrationQueueTests(unittest.TestCase):
         entry = self.state.get_entry("/queued.txt")
         self.assertEqual(entry["hydrate_attempt_count"], 0)
         self.assertIsNotNone(entry["hydrate_next_attempt_at"])
+        self.assertEqual(entry["hydrate_last_error"], "expired session")
         self.engine._schedule_download_with_delay.assert_not_called()
+
+    def test_recovery_reschedules_auth_blocked_hydration(self):
+        self._add_unhydrated_entry("/queued.txt")
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+        self.engine.scheduled_downloads.add("/queued.txt")
+        self.engine._download_job("/queued.txt")
+        self.engine._schedule_download = Mock()
+
+        cleared, path = queue_recovery.clear_failures(self.state.db_path)
+        self.engine._schedule_all_unhydrated()
+
+        self.assertEqual((cleared, path), (1, None))
+        self.assertIsNone(
+            self.state.get_entry("/queued.txt")["hydrate_next_attempt_at"]
+        )
+        self.engine._schedule_download.assert_called_once_with("/queued.txt")
 
     def test_hydration_exhaustion_does_not_block_upload_sync(self):
         self._add_unhydrated_entry("/queued.txt", dirty=True)

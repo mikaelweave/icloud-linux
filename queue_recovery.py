@@ -10,7 +10,7 @@ import sys
 import yaml
 
 
-WRITE_TIMEOUT_SECONDS = 10
+WRITE_TIMEOUT_SECONDS = 30
 
 
 def normalize_path(path):

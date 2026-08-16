@@ -55,6 +55,7 @@ SYNC_FAILURE_TERMINAL = "terminal"
 SYNC_FAILURE_TRANSIENT = "transient"
 MAX_SYNC_ATTEMPTS = 8
 AUTH_SYNC_COOLDOWN_SECONDS = 300
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
 AUTH_ERROR_TYPES = (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
@@ -279,8 +280,15 @@ class SyncState:
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(
+            db_path,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute(
+            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_SECONDS * 1000}"
+        )
         try:
             journal_mode = self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if journal_mode.lower() != "wal":
@@ -605,22 +613,31 @@ class SyncState:
             self.conn.commit()
         return cursor.rowcount
 
-    def defer_sync(self, path, delay):
+    def defer_sync(self, path, delay, error=None):
         with self.lock:
             self.conn.execute(
                 """
                 UPDATE entries
-                SET sync_next_attempt_at = ?
+                SET sync_next_attempt_at = ?,
+                    sync_last_error = ?
                 WHERE path = ?
                 """,
-                (int(time.time()) + int(delay), path),
+                (
+                    int(time.time()) + int(delay),
+                    str(error)[:500] if error is not None else None,
+                    path,
+                ),
             )
             self.conn.commit()
 
     def clear_sync_backoff(self):
         with self.lock:
             self.conn.execute(
-                "UPDATE entries SET sync_next_attempt_at = NULL"
+                """
+                UPDATE entries
+                SET sync_next_attempt_at = NULL
+                WHERE sync_attempt_count > 0
+                """
             )
             self.conn.commit()
 
@@ -672,22 +689,31 @@ class SyncState:
             )
             self.conn.commit()
 
-    def defer_hydrate(self, path, delay):
+    def defer_hydrate(self, path, delay, error=None):
         with self.lock:
             self.conn.execute(
                 """
                 UPDATE entries
-                SET hydrate_next_attempt_at = ?
+                SET hydrate_next_attempt_at = ?,
+                    hydrate_last_error = ?
                 WHERE path = ?
                 """,
-                (int(time.time()) + int(delay), path),
+                (
+                    int(time.time()) + int(delay),
+                    str(error)[:500] if error is not None else None,
+                    path,
+                ),
             )
             self.conn.commit()
 
     def clear_hydrate_backoff(self):
         with self.lock:
             self.conn.execute(
-                "UPDATE entries SET hydrate_next_attempt_at = NULL"
+                """
+                UPDATE entries
+                SET hydrate_next_attempt_at = NULL
+                WHERE hydrate_attempt_count > 0
+                """
             )
             self.conn.commit()
 
@@ -1736,6 +1762,7 @@ class ICloudSyncEngine:
             self.state.defer_hydrate(
                 path,
                 self._retry_delay_for_attempt(1),
+                exc,
             )
             return classification, 0, False
         attempt, exhausted = self.state.record_hydrate_failure(
@@ -1895,6 +1922,7 @@ class ICloudSyncEngine:
             self.state.defer_sync(
                 entry["path"],
                 self._retry_delay_for_attempt(1),
+                exc,
             )
             self.sync_auth_cooldown_until = (
                 time.time() + AUTH_SYNC_COOLDOWN_SECONDS

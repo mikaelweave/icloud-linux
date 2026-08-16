@@ -136,6 +136,73 @@ def inspect_queue(db_path, mirror_root, now=None):
         else:
             report["pending_retries"] = None
 
+        pending_sync_columns = {
+            "path",
+            "dirty",
+            "tombstone",
+            "failed",
+            "sync_attempt_count",
+            "sync_next_attempt_at",
+        }
+        if pending_sync_columns <= columns:
+            report["pending_sync_entries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path FROM entries
+                    WHERE dirty = 1
+                      AND tombstone = 0
+                      AND failed = 0
+                      AND sync_attempt_count = 0
+                      AND sync_next_attempt_at IS NULL
+                    ORDER BY path
+                    """
+                )
+            ]
+        else:
+            report["pending_sync_entries"] = None
+
+        auth_sync_columns = {
+            "path",
+            "dirty",
+            "tombstone",
+            "sync_attempt_count",
+            "sync_next_attempt_at",
+            "sync_last_error",
+        }
+        auth_hydrate_columns = {
+            "path",
+            "hydrated",
+            "hydrate_attempt_count",
+            "hydrate_next_attempt_at",
+            "hydrate_last_error",
+        }
+        if auth_sync_columns <= columns and auth_hydrate_columns <= columns:
+            report["auth_blocked_entries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path, 'sync' AS operation, sync_last_error AS error
+                    FROM entries
+                    WHERE (dirty = 1 OR tombstone = 1)
+                      AND sync_attempt_count = 0
+                      AND sync_next_attempt_at IS NOT NULL
+                      AND sync_last_error IS NOT NULL
+                    UNION ALL
+                    SELECT path, 'hydration' AS operation,
+                           hydrate_last_error AS error
+                    FROM entries
+                    WHERE hydrated = 0
+                      AND hydrate_attempt_count = 0
+                      AND hydrate_next_attempt_at IS NOT NULL
+                      AND hydrate_last_error IS NOT NULL
+                    ORDER BY path, operation
+                    """
+                )
+            ]
+        else:
+            report["auth_blocked_entries"] = None
+
         quarantine_columns = {"path", "failed", "sync_last_error"}
         if quarantine_columns <= columns:
             report["quarantined_entries"] = [
@@ -171,6 +238,30 @@ def inspect_queue(db_path, mirror_root, now=None):
             ]
         else:
             report["hydrate_exhausted_entries"] = None
+
+        pending_hydrate_columns = {
+            "path",
+            "hydrate_attempt_count",
+            "hydrate_next_attempt_at",
+            "hydrate_last_error",
+        }
+        if pending_hydrate_columns <= columns:
+            report["pending_hydration_retries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path, hydrate_attempt_count, hydrate_next_attempt_at,
+                           hydrate_last_error
+                    FROM entries
+                    WHERE hydrate_attempt_count > 0
+                      AND hydrate_attempt_count < ?
+                    ORDER BY path
+                    """,
+                    (MAX_SYNC_ATTEMPTS,),
+                )
+            ]
+        else:
+            report["pending_hydration_retries"] = None
 
         if {"path", "tombstone"} <= columns:
             report["pending_tombstones"] = [
@@ -271,12 +362,26 @@ def queue_summary(report):
     if "schema_error" in report:
         return f"Queue: unavailable ({report['schema_error']})"
     pending = report.get("pending_retries")
+    pending_sync = report.get("pending_sync_entries")
+    pending_hydration = report.get("pending_hydration_retries")
+    auth_blocked = report.get("auth_blocked_entries")
     quarantined = report.get("quarantined_entries")
     hydrate_exhausted = report.get("hydrate_exhausted_entries")
-    if pending is None or quarantined is None or hydrate_exhausted is None:
+    if (
+        pending is None
+        or pending_sync is None
+        or pending_hydration is None
+        or auth_blocked is None
+        or quarantined is None
+        or hydrate_exhausted is None
+    ):
         return "Queue: unavailable (durable queue schema is incomplete)"
     return (
-        f"Queue: {len(pending)} pending, {len(quarantined)} quarantined, "
+        f"Queue: {len(pending_sync)} sync-ready, "
+        f"{len(pending)} sync-pending, "
+        f"{len(pending_hydration)} hydrate-pending, "
+        f"{len(auth_blocked)} authentication-blocked, "
+        f"{len(quarantined)} quarantined, "
         f"{len(hydrate_exhausted)} hydrate-failed"
     )
 
@@ -334,6 +439,38 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
             )
         print()
 
+    pending_sync_entries = report["pending_sync_entries"]
+    if pending_sync_entries:
+        print(f"Pending sync entries ({len(pending_sync_entries)}):")
+        for entry in pending_sync_entries:
+            print(f"  {entry['path']}")
+        print()
+
+    pending_hydration_retries = report["pending_hydration_retries"]
+    if pending_hydration_retries:
+        print(
+            "Pending hydration retries "
+            f"({len(pending_hydration_retries)}):"
+        )
+        for entry in pending_hydration_retries:
+            print(
+                f"  {entry['path']} (attempt {entry['hydrate_attempt_count']}; "
+                f"due {format_due(entry['hydrate_next_attempt_at'])}): "
+                f"{_truncate_error(entry['hydrate_last_error'])}"
+            )
+        print()
+
+    auth_blocked_entries = report["auth_blocked_entries"]
+    if auth_blocked_entries:
+        print(f"Waiting for authentication ({len(auth_blocked_entries)}):")
+        for entry in auth_blocked_entries:
+            print(
+                f"  {entry['path']} ({entry['operation']}): "
+                f"{_truncate_error(entry['error'])}"
+            )
+            print("    Remedy: run './icloudctl auth'")
+        print()
+
     quarantined_entries = report["quarantined_entries"]
     if quarantined_entries:
         print(
@@ -389,6 +526,9 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
 
     if (
         not pending_retries
+        and not pending_sync_entries
+        and not pending_hydration_retries
+        and not auth_blocked_entries
         and not quarantined_entries
         and not hydrate_exhausted
         and not pending_tombstones
