@@ -266,6 +266,87 @@ cmd_doctor() {
     echo "MISSING: $ENV_FILE"
   fi
   systemctl --user --no-pager status icloud.service >/dev/null 2>&1 && echo "OK: service exists" || echo "WARN: service not initialized"
+
+  if [[ -n "${WSL_DISTRO_NAME:-}" ]] || grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+    local init_comm
+    local mount_dir="${ICLOUD_MOUNT:-$MOUNT_DIR_DEFAULT}"
+    local wsl_distro="${WSL_DISTRO_NAME:-<distro>}"
+    local windows_mount="\\\\wsl.localhost\\$wsl_distro${mount_dir//\//\\}"
+
+    init_comm="$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$init_comm" == "systemd" ]]; then
+      echo "OK: systemd is PID 1"
+    else
+      echo "WARN: systemd is not PID 1 (found: ${init_comm:-unknown})"
+      echo "       Add '[boot]' and 'systemd=true' to /etc/wsl.conf, then run 'wsl --shutdown' from Windows."
+    fi
+
+    local linger
+    linger="$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)"
+    if [[ "$linger" == "yes" ]]; then
+      echo "OK: user lingering is enabled"
+    else
+      echo "WARN: user lingering is not enabled"
+      echo '       Run: loginctl enable-linger "$USER" so icloud.service runs without an interactive session.'
+    fi
+
+    if grep -Eq '^[[:space:]]*user_allow_other([[:space:]]*(#.*)?)?$' /etc/fuse.conf 2>/dev/null; then
+      echo "OK: /etc/fuse.conf permits user_allow_other"
+    else
+      echo "WARN: /etc/fuse.conf does not permit user_allow_other"
+      echo "       Uncomment 'user_allow_other' in /etc/fuse.conf."
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]] && awk '
+      /^[[:space:]]*allow_other[[:space:]]*:/ {
+        value = $0
+        sub(/^[^:]*:[[:space:]]*/, "", value)
+        sub(/[[:space:]]*(#.*)?$/, "", value)
+        if (value == "true") enabled = 1
+      }
+      END { exit !enabled }
+    ' "$CONFIG_FILE"; then
+      echo "OK: fuse_options.allow_other is enabled"
+    else
+      echo "WARN: fuse_options.allow_other is not enabled"
+      echo "       Set 'allow_other: true' under 'fuse_options:' in $CONFIG_FILE so Windows can see the mount."
+    fi
+
+    if mountpoint -q "$mount_dir"; then
+      if ls "$mount_dir" >/dev/null 2>&1; then
+        echo "OK: mount is readable ($mount_dir)"
+      else
+        echo "WARN: mount is not readable ($mount_dir)"
+        echo "       Check the service status and FUSE permissions."
+      fi
+    else
+      echo "WARN: mount is not mounted ($mount_dir)"
+      echo "       Start it with './icloudctl start'."
+    fi
+    echo "Windows path: $windows_mount"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+      local cache_dir
+      cache_dir="$(awk '
+        /^[[:space:]]*cache_dir[[:space:]]*:/ {
+          value = $0
+          sub(/^[^:]*:[[:space:]]*/, "", value)
+          sub(/[[:space:]]*(#.*)?$/, "", value)
+          gsub(/^["'\'']|["'\'']$/, "", value)
+          print value
+          exit
+        }
+      ' "$CONFIG_FILE")"
+      case "$cache_dir" in
+        "~") cache_dir="$HOME" ;;
+        "~/"*) cache_dir="$HOME/${cache_dir#~/}" ;;
+      esac
+      if [[ -n "$cache_dir" ]] && [[ "$(realpath -m "$cache_dir" 2>/dev/null || printf '%s' "$cache_dir")" == /mnt/* ]]; then
+        echo "WARN: cache_dir is on DrvFs ($cache_dir)"
+        echo "       Move cache_dir to the distro's ext4 filesystem; SQLite WAL locking does not work properly on /mnt/."
+      fi
+    fi
+  fi
 }
 
 cmd_quickstart() {

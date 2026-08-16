@@ -86,6 +86,68 @@ This will:
 
 After setup, your files will be mounted at `~/iCloud` unless you chose another path.
 
+## Running under WSL2 (Windows)
+
+This supported path requires WSL2. Run the driver inside the distro and enable
+systemd by adding this to
+`/etc/wsl.conf`, then restart WSL:
+
+```ini
+[boot]
+systemd=true
+```
+
+For Windows to see the FUSE mount, uncomment `user_allow_other` in
+`/etc/fuse.conf` and set `fuse_options.allow_other: true` in this project's
+config. The Windows 9p server accesses the mount as a different Linux user.
+Use the `permissions` block (`uid`, `gid`, `file_mode`, and `dir_mode`) if you
+need to adjust the presented ownership or modes.
+
+Open the mount from Windows at
+`\\wsl.localhost\<distro>\<mountpoint-path>`, for example
+`\\wsl.localhost\Ubuntu\home\alice\iCloud`.
+
+To keep the mount available without an open WSL terminal, all three of the
+following are required:
+
+1. Enable lingering for the Linux user so its `systemctl --user` service keeps
+   running after the last interactive session ends:
+
+   ```bash
+   loginctl enable-linger "$USER"
+   ```
+
+2. Put this in `%USERPROFILE%\.wslconfig`:
+
+   ```ini
+   [experimental]
+   vmIdleTimeout=-1
+   ```
+
+3. Run `wsl --shutdown` after changing `.wslconfig`, then create a Task
+   Scheduler task that runs at logon and starts the distro, for example:
+
+   ```text
+   wsl.exe -d <distro> -u root /bin/true
+   ```
+
+The task can instead start the service directly. `loginctl enable-linger`
+keeps the user systemd manager and `icloud.service` alive without an
+interactive session, but it does not keep the WSL VM alive; that requires both
+`vmIdleTimeout=-1` and the Task Scheduler logon task.
+
+Keep `cache_dir` on the distro's ext4 filesystem, not under `/mnt/c`: DrvFs
+does not provide the locking SQLite WAL needs.
+
+Troubleshooting:
+
+- The mount is empty or permission-denied from Windows: enable both
+  `fuse_options.allow_other` and `user_allow_other`.
+- The mount disappears after idle: set `vmIdleTimeout=-1` and run the logon
+  Task Scheduler task; also run `loginctl enable-linger "$USER"` so the user
+  service persists after logout.
+- The unit does not start: verify `ps -p 1 -o comm=` reports `systemd`.
+
 ## Simple Setup, Step By Step
 
 If you prefer to do setup one step at a time:
