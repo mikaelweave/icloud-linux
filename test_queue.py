@@ -117,6 +117,50 @@ class QueueDiagnosticTests(unittest.TestCase):
         self.assertIn("Dirty and unhydrated: 1", output)
         self.assertIn("Oldest pending item:", output)
 
+    def test_distinguishes_pending_retries_from_quarantined_entries(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        self.add_entry(conn, "/retry.txt", dirty=1)
+        self.add_entry(conn, "/quarantined.txt", dirty=1)
+        conn.execute(
+            """
+            UPDATE entries
+            SET sync_attempt_count = 1, sync_last_error = ?
+            WHERE path = ?
+            """,
+            ("temporary outage", "/retry.txt"),
+        )
+        conn.execute(
+            """
+            UPDATE entries
+            SET failed = 1, sync_attempt_count = 8, sync_last_error = ?
+            WHERE path = ?
+            """,
+            ("Mirror file is missing; restore it or delete through FUSE.", "/quarantined.txt"),
+        )
+        conn.commit()
+        conn.close()
+
+        result, output = self.run_queue()
+
+        self.assertEqual(result, 0)
+        self.assertIn("Pending retries: 1", output)
+        self.assertIn(
+            "/retry.txt (failed=0): temporary outage",
+            output,
+        )
+        self.assertIn("Quarantined entries: 1", output)
+        self.assertIn(
+            "/quarantined.txt (failed=1): Mirror file is missing",
+            output,
+        )
+
     def test_reports_missing_app_library_as_at_risk(self):
         conn = self.create_db()
         self.add_entry(conn, "/library", entry_type="app_library", dirty=1)

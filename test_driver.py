@@ -18,6 +18,7 @@ from driver import (
     ICloudSyncEngine,
     LocalMirror,
     MAX_SYNC_ATTEMPTS,
+    MissingMirrorFile,
     NamedFileStream,
     SYNC_FAILURE_AUTH,
     SYNC_FAILURE_TERMINAL,
@@ -874,6 +875,22 @@ class DurableSyncQueueTests(unittest.TestCase):
         self.assertIsNone(self.state.get_entry("/removed"))
         self.assertIsNone(self.state.get_entry("/removed/child.txt"))
 
+    def test_non_404_terminal_delete_preserves_tombstone_and_quarantines(self):
+        self._add_entry("/removed.txt", remote_drivewsid="file-1")
+        self.state.mark_tombstone("/removed.txt")
+        node = Mock()
+        node.delete.side_effect = MissingMirrorFile("mirror file is missing")
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine._sync_tombstone(self.state.get_entry("/removed.txt"))
+
+        entry = self.state.get_entry("/removed.txt")
+        node.delete.assert_called_once_with()
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["tombstone"], 1)
+        self.assertEqual(entry["failed"], 1)
+        self.assertIn("mirror file is missing", entry["sync_last_error"])
+
     def test_success_clears_retry_state(self):
         self._add_entry("/queued.txt")
         self.state.record_sync_failure(
@@ -920,6 +937,25 @@ class DurableSyncQueueTests(unittest.TestCase):
         entry = self.state.get_entry("/missing/child.txt")
         self.assertEqual(entry["sync_attempt_count"], 0)
         self.assertEqual(entry["failed"], 0)
+
+    def test_missing_mirror_file_is_quarantined_without_remote_delete(self):
+        self._add_entry("/missing.txt", remote_drivewsid="file-1")
+        parent_node = Mock()
+        parent_node.data = {}
+        remote_node = Mock()
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine._node_from_entry = Mock(return_value=remote_node)
+
+        self.engine.sync_dirty_entries()
+        entry = self.state.get_entry("/missing.txt")
+        self.assertEqual(entry["failed"], 1)
+        self.assertEqual(entry["tombstone"], 0)
+        self.assertIn("mirror file is missing", entry["sync_last_error"].lower())
+
+        self.engine.sync_dirty_entries()
+
+        self.assertEqual(self.state.list_dirty_entries(), [])
+        remote_node.delete.assert_not_called()
 
     def test_child_recovers_after_parent_quarantine_is_cleared(self):
         self.mirror.ensure_dir("/parent")
@@ -1151,6 +1187,37 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.state.get_entry("/allowed/queued.txt")["dirty"],
             1,
         )
+
+    def test_unlink_of_missing_mirror_file_recovers_quarantined_tombstone(self):
+        self._add_entry("/allowed/removed.txt")
+        self.mirror.remove_file("/allowed/removed.txt")
+        self.state.mark_dirty("/allowed/removed.txt")
+        parent_node = Mock()
+        parent_node.data = {}
+        remote_node = Mock()
+        self.engine._ensure_remote_parent = Mock(return_value=parent_node)
+        self.engine._node_from_entry = Mock(return_value=remote_node)
+
+        self.engine.sync_dirty_entries()
+
+        quarantined = self.state.get_entry("/allowed/removed.txt")
+        self.assertEqual(quarantined["failed"], 1)
+        self.assertEqual(quarantined["tombstone"], 0)
+
+        self.assertEqual(self.fs.unlink("/allowed/removed.txt"), 0)
+
+        entry = self.state.get_entry("/allowed/removed.txt")
+        self.assertEqual(entry["tombstone"], 1)
+        self.assertEqual(entry["failed"], 0)
+        self.assertEqual(entry["sync_attempt_count"], 0)
+        self.assertIsNone(entry["sync_next_attempt_at"])
+        self.assertIsNone(entry["sync_last_error"])
+        self.assertFalse(self.mirror.exists("/allowed/removed.txt"))
+
+        self.engine.sync_dirty_entries()
+
+        remote_node.delete.assert_called_once_with()
+        self.assertIsNone(self.state.get_entry("/allowed/removed.txt"))
 
     def test_atomic_file_replacement_preserves_destination_remote_identity(self):
         self._add_entry("/allowed/note.md", content=b"old")

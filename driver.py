@@ -70,6 +70,10 @@ class SyncAuthenticationBlocked(Exception):
     pass
 
 
+class MissingMirrorFile(Exception):
+    pass
+
+
 class SyncPassContext:
     def __init__(self):
         self.failed_remote_parents = set()
@@ -99,17 +103,23 @@ def _http_status_from_exception(exc):
     return None
 
 
+def remote_item_is_absent(exc, operation):
+    """Return whether a delete received a definitive remote not-found response."""
+    return operation == "delete" and _http_status_from_exception(exc) == 404
+
+
 def classify_sync_failure(exc, operation):
     """Classify a failed sync operation for the durable sync queue."""
     if isinstance(exc, AUTH_ERROR_TYPES):
         return SYNC_FAILURE_AUTH
+    if isinstance(exc, MissingMirrorFile):
+        return SYNC_FAILURE_TERMINAL
 
     # Conservative allow-list: only conditions we can prove are permanent are
     # terminal. pyicloud raises a typed auth exception only for HTTP 450, so a
     # bare 403 may be an expired session rather than a real permission denial;
     # retrying it costs bounded latency, while quarantining it needs a human.
-    status = _http_status_from_exception(exc)
-    if status == 404 and operation == "delete":
+    if remote_item_is_absent(exc, operation):
         return SYNC_FAILURE_TERMINAL
     return SYNC_FAILURE_TRANSIENT
 
@@ -584,7 +594,11 @@ class SyncState:
                     size = COALESCE(?, size),
                     mtime = COALESCE(?, mtime),
                     hydrated = COALESCE(?, hydrated),
-                    local_sha256 = COALESCE(?, local_sha256)
+                    local_sha256 = COALESCE(?, local_sha256),
+                    sync_attempt_count = 0,
+                    sync_next_attempt_at = NULL,
+                    sync_last_error = NULL,
+                    failed = 0
                 WHERE path = ?
                 """,
                 (size, mtime, hydrated, local_sha256, path),
@@ -597,7 +611,11 @@ class SyncState:
                 """
                 UPDATE entries
                 SET tombstone = 1,
-                    dirty = 1
+                    dirty = 1,
+                    sync_attempt_count = 0,
+                    sync_next_attempt_at = NULL,
+                    sync_last_error = NULL,
+                    failed = 0
                 WHERE path = ?
                 """,
                 (path,),
@@ -1733,7 +1751,7 @@ class ICloudSyncEngine:
                 node = self._node_from_entry(entry)
                 node.delete()
             except Exception as exc:
-                if classify_sync_failure(exc, "delete") != SYNC_FAILURE_TERMINAL:
+                if not remote_item_is_absent(exc, "delete"):
                     if self._record_sync_failure(
                         entry, exc, "delete", sync_context
                     ):
@@ -1817,9 +1835,17 @@ class ICloudSyncEngine:
                 synced_path=entry.get("synced_path"),
             )
             if not self.mirror.exists(entry["path"]):
-                self.state.mark_tombstone(entry["path"])
-                self._log_sync("file-missing-marked-tombstone", path=entry["path"])
-                return
+                self._log_sync(
+                    "file-missing-quarantined",
+                    level=logging.ERROR,
+                    path=entry["path"],
+                )
+                raise MissingMirrorFile(
+                    "Mirror file is missing; remote data was not deleted. "
+                    "Restore the file in the mirror, or delete it through the "
+                    "mounted filesystem if deletion is intended; manual "
+                    "resolution is required."
+                )
 
             self.ensure_local_file(entry["path"])
             is_shared = bool(entry.get("remote_shareid") or parent_node.data.get("shareID"))

@@ -87,14 +87,17 @@ def inspect_queue(db_path, mirror_root, now=None):
 
         required_for_missing = {"path", "type", "dirty", "tombstone"}
         if required_for_missing <= columns:
-            candidates = conn.execute(
-                """
+            missing_query = """
                 SELECT path FROM entries
                 WHERE COALESCE(type, '') != 'folder'
                   AND dirty = 1
                   AND tombstone = 0
-                ORDER BY path
-                """
+            """
+            if "failed" in columns:
+                missing_query += "\n  AND failed = 0"
+            missing_query += "\nORDER BY path"
+            candidates = conn.execute(
+                missing_query
             )
             report["missing_mirror_files"] = [
                 row["path"]
@@ -103,6 +106,45 @@ def inspect_queue(db_path, mirror_root, now=None):
             ]
         else:
             report["missing_mirror_files"] = None
+
+        retry_columns = {
+            "path",
+            "dirty",
+            "tombstone",
+            "failed",
+            "sync_attempt_count",
+            "sync_last_error",
+        }
+        if retry_columns <= columns:
+            report["pending_retries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path, failed, sync_last_error FROM entries
+                    WHERE (dirty = 1 OR tombstone = 1)
+                      AND failed = 0
+                      AND sync_attempt_count > 0
+                    ORDER BY path
+                    """
+                )
+            ]
+        else:
+            report["pending_retries"] = None
+
+        quarantine_columns = {"path", "failed", "sync_last_error"}
+        if quarantine_columns <= columns:
+            report["quarantined_entries"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT path, failed, sync_last_error FROM entries
+                    WHERE failed = 1
+                    ORDER BY path
+                    """
+                )
+            ]
+        else:
+            report["quarantined_entries"] = None
 
         if {"dirty", "hydrated"} <= columns:
             report["dirty_unhydrated"] = _count(
@@ -209,6 +251,22 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
             "  Pending without last_synced_at: "
             f"{report['pending_without_timestamp']}"
         )
+    pending_retries = report["pending_retries"]
+    if pending_retries is None:
+        print("  Pending retries: unavailable")
+    else:
+        print(f"  Pending retries: {len(pending_retries)}")
+        for entry in pending_retries:
+            error = entry["sync_last_error"] or "no error recorded"
+            print(f"    {entry['path']} (failed={entry['failed']}): {error}")
+    quarantined_entries = report["quarantined_entries"]
+    if quarantined_entries is None:
+        print("  Quarantined entries: unavailable")
+    else:
+        print(f"  Quarantined entries: {len(quarantined_entries)}")
+        for entry in quarantined_entries:
+            error = entry["sync_last_error"] or "no error recorded"
+            print(f"    {entry['path']} (failed={entry['failed']}): {error}")
     print()
 
     missing = report["missing_mirror_files"]
@@ -223,7 +281,10 @@ def print_report(config_path, cache_dir, db_path, mirror_root, report):
     if not missing:
         return
 
-    print("  These dirty files would be marked tombstone on a sync pass:")
+    print(
+        "  These dirty files will be quarantined on a sync pass; "
+        "their remote copies will not be deleted:"
+    )
     for path in missing[:MISSING_PATH_LIMIT]:
         print(f"  {path}")
     remaining = len(missing) - MISSING_PATH_LIMIT
