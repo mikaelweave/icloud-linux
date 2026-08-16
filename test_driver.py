@@ -290,6 +290,170 @@ class DriverStateTests(unittest.TestCase):
 
         self.assertTrue(self.mirror.is_dir("/Obsidian"))
 
+    def test_reconcile_persistent_cache_queues_changed_hydrated_file_for_upload(self):
+        path = "/changed.txt"
+        self.mirror.write(path, b"before", 0)
+        stats = self.mirror.stat_local(path)
+        checksum = self.mirror.file_sha256(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-1",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "local_sha256": checksum,
+                "synced_path": path,
+            }
+        )
+        self.mirror.write(path, b"changed while offline", 0)
+        logger = Mock()
+        engine = ICloudSyncEngine(Mock(), self.mirror, self.state, logger)
+
+        engine._reconcile_persistent_cache()
+
+        entry = self.state.get_entry(path)
+        report = queue_diagnostic.inspect_queue(self.state.db_path, self.root)
+        self.assertEqual(entry["dirty"], 1)
+        self.assertEqual(
+            [item["path"] for item in report["pending_sync_entries"]],
+            [path],
+        )
+        self.assertIn("1 sync-ready", queue_diagnostic.queue_summary(report))
+        logger.info.assert_any_call(
+            "Mirror file %s changed while the driver was not running and has been queued for upload",
+            path,
+        )
+        logger.info.assert_any_call(
+            "Persistent cache ready: %s entries, %s directories recreated, "
+            "%s files queued for hydration, %s files queued for upload",
+            1,
+            0,
+            0,
+            1,
+        )
+
+    def test_reconcile_persistent_cache_keeps_unchanged_hydrated_file_clean(self):
+        path = "/unchanged.txt"
+        self.mirror.write(path, b"unchanged", 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-1",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "local_sha256": self.mirror.file_sha256(path),
+                "synced_path": path,
+            }
+        )
+        logger = Mock()
+        engine = ICloudSyncEngine(Mock(), self.mirror, self.state, logger)
+
+        engine._reconcile_persistent_cache()
+
+        self.assertEqual(self.state.get_entry(path)["dirty"], 0)
+        logger.info.assert_called_once_with(
+            "Persistent cache ready: %s entries, %s directories recreated, "
+            "%s files queued for hydration, %s files queued for upload",
+            1,
+            0,
+            0,
+            0,
+        )
+
+    def test_reconcile_persistent_cache_does_not_queue_file_without_stored_checksum(self):
+        path = "/unknown-checksum.txt"
+        self.mirror.write(path, b"before", 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-1",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "local_sha256": None,
+                "synced_path": path,
+            }
+        )
+        self.mirror.write(path, b"changed while offline", 0)
+        logger = Mock()
+        engine = ICloudSyncEngine(Mock(), self.mirror, self.state, logger)
+
+        engine._reconcile_persistent_cache()
+
+        entry = self.state.get_entry(path)
+        self.assertEqual(entry["dirty"], 0)
+        self.assertEqual(entry["local_sha256"], self.mirror.file_sha256(path))
+        logger.info.assert_called_once_with(
+            "Persistent cache ready: %s entries, %s directories recreated, "
+            "%s files queued for hydration, %s files queued for upload",
+            1,
+            0,
+            0,
+            0,
+        )
+
+    def test_reconcile_persistent_cache_preserves_quarantine_while_queueing_change(self):
+        path = "/quarantined.txt"
+        self.mirror.write(path, b"before", 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-1",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": True,
+                "tombstone": False,
+                "local_sha256": self.mirror.file_sha256(path),
+                "synced_path": path,
+            }
+        )
+        for _ in range(MAX_SYNC_ATTEMPTS):
+            self.state.record_sync_failure(
+                path,
+                RuntimeError("permanent failure"),
+                SYNC_FAILURE_TRANSIENT,
+                MAX_SYNC_ATTEMPTS,
+            )
+        self.mirror.write(path, b"changed while offline", 0)
+        logger = Mock()
+        engine = ICloudSyncEngine(Mock(), self.mirror, self.state, logger)
+
+        engine._reconcile_persistent_cache()
+
+        entry = self.state.get_entry(path)
+        self.assertEqual(entry["dirty"], 1)
+        self.assertEqual(entry["failed"], 1)
+        self.assertEqual(entry["sync_attempt_count"], MAX_SYNC_ATTEMPTS)
+        self.assertEqual(entry["sync_last_error"], "permanent failure")
+        logger.info.assert_any_call(
+            "Persistent cache ready: %s entries, %s directories recreated, "
+            "%s files queued for hydration, %s files queued for upload",
+            1,
+            0,
+            0,
+            0,
+        )
+
     def test_remote_shareid_round_trips_through_state(self):
         self.state.upsert_entry(
             {

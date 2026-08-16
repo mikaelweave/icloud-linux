@@ -1376,6 +1376,7 @@ class ICloudSyncEngine:
         entries = self.state.list_entries()
         missing_files = 0
         recreated_dirs = 0
+        queued_uploads = 0
 
         for entry in entries:
             path = entry["path"]
@@ -1402,6 +1403,18 @@ class ICloudSyncEngine:
                     mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
                     if size_changed or mtime_changed or not checksum:
                         checksum = self.mirror.file_sha256(path)
+                        if (
+                            entry.get("local_sha256")
+                            and checksum != entry["local_sha256"]
+                            and not entry["dirty"]
+                        ):
+                            entry = {**entry, "dirty": True}
+                            queued_uploads += 1
+                            self.logger.info(
+                                "Mirror file %s changed while the driver was not running "
+                                "and has been queued for upload",
+                                path,
+                            )
                 self.state.upsert_entry(
                     {
                         **entry,
@@ -1432,10 +1445,12 @@ class ICloudSyncEngine:
                 )
 
         self.logger.info(
-            "Persistent cache ready: %s entries, %s directories recreated, %s files queued for hydration",
+            "Persistent cache ready: %s entries, %s directories recreated, "
+            "%s files queued for hydration, %s files queued for upload",
             len(entries),
             recreated_dirs,
             missing_files,
+            queued_uploads,
         )
 
     def _is_directory_type(self, node_type):
