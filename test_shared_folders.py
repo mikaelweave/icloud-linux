@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import fuse
+from requests import Response
 
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState, resolve_permissions_config
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
@@ -247,9 +248,11 @@ class SharedFolderEngineTests(unittest.TestCase):
                 }
             }
         }
-        response = Mock()
+        response = Response()
+        response.status_code = 200
+        response.headers["Content-Length"] = "14"
         response.raw = NoUnboundedReadStream(b"shared content")
-        response.close = Mock()
+        response.close = Mock(wraps=response.close)
         node = Mock()
         node.name = "a.txt"
         node.data = {

@@ -85,6 +85,10 @@ class HydrationFailed(Exception):
     pass
 
 
+class HydrationTruncated(Exception):
+    pass
+
+
 class RemoteSnapshot(dict):
     def __init__(self):
         super().__init__()
@@ -1148,13 +1152,27 @@ class LocalMirror:
         self.ensure_parent(path)
         local = self.local_path(path)
         fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
+        written = 0
         try:
             with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(source, handle, length=chunk_size)
+                if hasattr(source, "read"):
+                    while True:
+                        chunk = source.read(chunk_size)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        written += len(chunk)
+                else:
+                    for chunk in source:
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        written += len(chunk)
             os.replace(tmp_path, local)
             if mtime is not None:
                 os.utime(local, (mtime, mtime))
             self._normalize_file_path(local)
+            return written
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -1511,7 +1529,54 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(self._open_remote_file(node, entry, path, stream=True)) as response:
-                    self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
+                    # iter_content replays requests' cached body if pyicloud already
+                    # consumed it while attempting to decode a JSON response.
+                    written = self.mirror.write_atomic_stream(
+                        path,
+                        response.iter_content(chunk_size=IO_CHUNK_SIZE),
+                        entry["mtime"],
+                    )
+                    headers = getattr(response, "headers", {}) or {}
+                    content_encoding = headers.get("Content-Encoding")
+                    try:
+                        expected_size = int(headers.get("Content-Length"))
+                        if expected_size < 0:
+                            expected_size = None
+                    except (TypeError, ValueError):
+                        expected_size = None
+                    try:
+                        entry_size = int(entry.get("size") or 0)
+                    except (TypeError, ValueError):
+                        entry_size = 0
+
+                    if content_encoding:
+                        truncated = entry_size > 0 and written == 0
+                        expected_for_log = entry_size
+                    elif expected_size is not None:
+                        truncated = written != expected_size
+                        expected_for_log = expected_size
+                    else:
+                        truncated = entry_size > 0 and written == 0
+                        expected_for_log = entry_size
+
+                    if truncated:
+                        self.logger.error(
+                            "Hydration truncated path=%s expected_bytes=%s actual_bytes=%s",
+                            path,
+                            expected_for_log,
+                            written,
+                        )
+                        try:
+                            self.mirror.remove_file(path)
+                        except FileNotFoundError:
+                            pass
+                        raise HydrationTruncated(
+                            "truncated download for {}: expected {} bytes, got {}".format(
+                                path,
+                                expected_for_log,
+                                written,
+                            )
+                        )
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
             self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))

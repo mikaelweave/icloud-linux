@@ -1,4 +1,5 @@
 import errno
+import gzip
 import io
 import os
 import shutil
@@ -10,8 +11,10 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
+from requests import Response
 from requests.exceptions import ConnectionError, Timeout
 from requests.models import RequestEncodingMixin
+from urllib3.response import HTTPResponse
 
 from driver import (
     ICloudFS,
@@ -123,8 +126,18 @@ class DriverStateTests(unittest.TestCase):
     def test_write_atomic_stream_copies_in_chunks(self):
         stream = NoUnboundedReadStream(b"streamed content")
 
-        self.mirror.write_atomic_stream("/docs/a.txt", stream)
+        written = self.mirror.write_atomic_stream("/docs/a.txt", stream)
 
+        self.assertEqual(written, len(b"streamed content"))
+        self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
+
+    def test_write_atomic_stream_accepts_chunk_iterable(self):
+        written = self.mirror.write_atomic_stream(
+            "/docs/a.txt",
+            (chunk for chunk in (b"streamed ", b"content")),
+        )
+
+        self.assertEqual(written, len(b"streamed content"))
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"streamed content")
 
     def test_named_file_stream_is_encoded_as_file_content(self):
@@ -815,6 +828,32 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.state.close()
         shutil.rmtree(self.root)
 
+    def _add_unhydrated_remote_file(self, path, size):
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": os.path.dirname(path),
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_zone": "zone-1",
+                "size": size,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.mirror.ensure_dir(os.path.dirname(path))
+
+    def _response(self, body, headers=None):
+        response = Response()
+        response.status_code = 200
+        response.headers.update(headers or {})
+        response.raw = io.BytesIO(body)
+        return response
+
     def test_start_uses_persistent_cache_without_initial_scan(self):
         self.state.upsert_entry(
             {
@@ -1063,9 +1102,8 @@ class SyncEngineStartupTests(unittest.TestCase):
             }
         )
         self.mirror.ensure_dir("/docs")
-        response = Mock()
+        response = self._response(b"chunked download", {"Content-Length": "16"})
         response.raw = NoUnboundedReadStream(b"chunked download")
-        response.close = Mock()
         node = Mock()
         node.open.return_value = response
         self.engine._node_from_entry = Mock(return_value=node)
@@ -1073,7 +1111,76 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine.ensure_local_file("/docs/a.txt")
 
         self.assertEqual(self.mirror.read("/docs/a.txt", 100, 0), b"chunked download")
-        response.close.assert_called_once()
+
+    def test_ensure_local_file_replays_consumed_json_response_content(self):
+        path = "/docs/settings.json"
+        content = b'{"setting": true}'
+        self._add_unhydrated_remote_file(path, len(content))
+        response = self._response(content, {"Content-Length": str(len(content))})
+        self.assertEqual(response.content, content)
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file(path)
+
+        self.assertEqual(self.mirror.read(path, 100, 0), content)
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 1)
+
+    def test_ensure_local_file_rejects_zero_byte_download_for_nonempty_entry(self):
+        path = "/docs/missing-content.json"
+        self._add_unhydrated_remote_file(path, 10)
+        response = self._response(b"")
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        with self.assertRaises(Exception) as caught:
+            self.engine.ensure_local_file(path)
+
+        self.assertEqual(type(caught.exception).__name__, "HydrationTruncated")
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 0)
+        self.assertFalse(self.mirror.exists(path))
+
+    def test_ensure_local_file_allows_decoded_gzip_size_to_differ_from_header(self):
+        path = "/docs/compressed.json"
+        content = b'{"decoded": "content"}'
+        compressed = gzip.compress(content)
+        self._add_unhydrated_remote_file(path, len(content))
+        response = self._response(
+            b"",
+            {
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(compressed)),
+            },
+        )
+        response.raw = HTTPResponse(
+            body=io.BytesIO(compressed),
+            headers=response.headers,
+            preload_content=False,
+            decode_content=False,
+        )
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file(path)
+
+        self.assertEqual(self.mirror.read(path, 100, 0), content)
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 1)
+
+    def test_ensure_local_file_allows_legitimately_empty_remote_file(self):
+        path = "/docs/empty.json"
+        self._add_unhydrated_remote_file(path, 0)
+        response = self._response(b"", {"Content-Length": "0"})
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        self.engine.ensure_local_file(path)
+
+        self.assertEqual(self.mirror.read(path, 100, 0), b"")
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 1)
 
     def test_sync_file_uploads_stream_without_buffering_entire_file(self):
         self.mirror.create_file("/docs/a.txt")
@@ -2046,6 +2153,32 @@ class DurableHydrationQueueTests(unittest.TestCase):
         self.assertGreater(entry["hydrate_next_attempt_at"], int(time.time()))
         self.assertEqual(entry["hydrate_last_error"], "timed out")
 
+    def test_short_download_records_queue_visible_hydration_failure(self):
+        path = "/queued.txt"
+        self._add_unhydrated_entry(path)
+        response = Response()
+        response.status_code = 200
+        response.headers["Content-Length"] = "10"
+        response.raw = io.BytesIO(b"short")
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+        self.engine._schedule_download_with_delay = Mock()
+        self.engine.scheduled_downloads.add(path)
+
+        self.engine._download_job(path)
+
+        entry = self.state.get_entry(path)
+        self.assertEqual(entry["hydrated"], 0)
+        self.assertEqual(entry["hydrate_attempt_count"], 1)
+        self.assertIn("expected 10 bytes, got 5", entry["hydrate_last_error"])
+        report = queue_diagnostic.inspect_queue(self.state.db_path, self.root)
+        self.assertEqual(
+            [item["path"] for item in report["pending_hydration_retries"]],
+            [path],
+        )
+        self.assertIn("1 hydrate-pending", queue_diagnostic.queue_summary(report))
+
     def test_restart_preserves_hydration_attempts_and_clears_backoff(self):
         self._add_unhydrated_entry("/queued.txt")
         self.state.record_hydrate_failure(
@@ -2105,7 +2238,9 @@ class DurableHydrationQueueTests(unittest.TestCase):
             SYNC_FAILURE_TRANSIENT,
             MAX_SYNC_ATTEMPTS,
         )
-        response = Mock()
+        response = Response()
+        response.status_code = 200
+        response.headers["Content-Length"] = "10"
         response.raw = io.BytesIO(b"downloaded")
         node = Mock()
         node.open.return_value = response

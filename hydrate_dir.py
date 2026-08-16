@@ -120,7 +120,7 @@ for i, row in enumerate(rows, 1):
     for attempt in range(1, 4):
         try:
             resp    = api.drive.get_file(docwsid, zone=zone, stream=True)
-            content = resp.raw.read()
+            content = b"".join(resp.iter_content(chunk_size=1024 * 1024))
             write_atomic(dest, content, mtime)
             mark_hydrated(path, content)
             ok += 1
