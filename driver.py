@@ -56,6 +56,7 @@ SYNC_FAILURE_TRANSIENT = "transient"
 MAX_SYNC_ATTEMPTS = 8
 AUTH_SYNC_COOLDOWN_SECONDS = 300
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
+CRAWL_FOLDER_TIMEOUT = 60
 AUTH_ERROR_TYPES = (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
@@ -1260,6 +1261,9 @@ class ICloudSyncEngine:
         self.sync_paths = normalize_icloud_paths(sync_paths) or None
         self.exclude_paths = normalize_icloud_paths(exclude_paths)
         self.executor = ThreadPoolExecutor(max_workers=self.warmup_workers, thread_name_prefix="warmup")
+        self._crawl_executor = None
+        self._crawl_executor_suspect = False
+        self._crawl_executor_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.refresh_now_event = threading.Event()
         self.path_locks = {}
@@ -1328,6 +1332,15 @@ class ICloudSyncEngine:
                 self.executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 self.executor.shutdown(wait=False)
+            with self._crawl_executor_lock:
+                crawl_executor = self._crawl_executor
+                self._crawl_executor = None
+                self._crawl_executor_suspect = False
+            if crawl_executor is not None:
+                try:
+                    crawl_executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    crawl_executor.shutdown(wait=False)
             for thread in list(self.threads):
                 thread.join(timeout=1)
 
@@ -1337,6 +1350,27 @@ class ICloudSyncEngine:
     def initial_scan(self):
         snapshot = self._crawl_remote_snapshot()
         self._apply_remote_snapshot(snapshot)
+
+    def _get_crawl_executor(self):
+        with self._crawl_executor_lock:
+            if self._crawl_executor_suspect:
+                crawl_executor = self._crawl_executor
+                self._crawl_executor = None
+                self._crawl_executor_suspect = False
+                if crawl_executor is not None:
+                    self.logger.warning(
+                        "Abandoning suspect remote metadata crawl worker after a timeout"
+                    )
+                    try:
+                        crawl_executor.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        crawl_executor.shutdown(wait=False)
+            if self._crawl_executor is None:
+                self._crawl_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="icloud-crawl",
+                )
+            return self._crawl_executor
 
     def _reconcile_persistent_cache(self):
         entries = self.state.list_entries()
@@ -1477,73 +1511,72 @@ class ICloudSyncEngine:
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
-        crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
-        FOLDER_TIMEOUT = 60  # seconds per folder before giving up
+        crawl_executor = self._get_crawl_executor()
 
-        try:
-            while queue:
-                node, path, inherited_shareid = queue.popleft()
-                if inherited_shareid and not node.data.get("shareID"):
-                    node.data = {**node.data, "shareID": inherited_shareid}
-                scanned_folders += 1
-                try:
-                    future = crawl_executor.submit(node.get_children, True)
-                    children = future.result(timeout=FOLDER_TIMEOUT)
-                except TimeoutError:
-                    snapshot.complete = False
-                    snapshot.failed_folders.append(path)
-                    self.logger.warning(
-                        "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
-                    )
-                    continue
-                except Exception as exc:
-                    snapshot.complete = False
-                    snapshot.failed_folders.append(path)
-                    self.logger.error("Failed to enumerate %s: %s", path, exc)
-                    continue
-
-                for child in children:
-                    child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
-                    meta = self._node_to_meta(
-                        child,
-                        child_path,
-                        inherited_shareid=node.data.get("shareID") or inherited_shareid,
-                    )
-                    if meta.get("remote_shareid") and not child.data.get("shareID"):
-                        child.data = {**child.data, "shareID": meta["remote_shareid"]}
-                    snapshot[meta["remote_drivewsid"]] = meta
-                    if self._is_directory_type(meta["type"]):
-                        # If sync_paths is set, only recurse into directories that are
-                        # on the path to or inside a sync_path. This avoids crawling
-                        # the entire iCloud Drive when only /Downloads is needed.
-                        if self.sync_paths is not None:
-                            should_recurse = False
-                            for sp in self.sync_paths:
-                                sp = sp.rstrip("/")
-                                cp = child_path.rstrip("/")
-                                # Recurse if child is a prefix of sync_path (ancestor)
-                                # or if child is inside sync_path (descendant)
-                                if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
-                                    should_recurse = True
-                                    break
-                            if not should_recurse:
-                                continue
-                        queue.append((child, child_path, meta.get("remote_shareid")))
-
-                now = time.time()
-                if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
-                    self.logger.info(
-                        "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
-                        scanned_folders,
-                        len(snapshot),
-                        len(queue),
-                    )
-                    last_progress_log = now
-        finally:
+        while queue:
+            node, path, inherited_shareid = queue.popleft()
+            if inherited_shareid and not node.data.get("shareID"):
+                node.data = {**node.data, "shareID": inherited_shareid}
+            scanned_folders += 1
             try:
-                crawl_executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                crawl_executor.shutdown(wait=False)
+                future = crawl_executor.submit(node.get_children, True)
+                children = future.result(timeout=CRAWL_FOLDER_TIMEOUT)
+            except TimeoutError:
+                snapshot.complete = False
+                snapshot.failed_folders.append(path)
+                with self._crawl_executor_lock:
+                    if crawl_executor is self._crawl_executor:
+                        self._crawl_executor_suspect = True
+                self.logger.warning(
+                    "Timed out enumerating %s after %ss; ending remote metadata crawl "
+                    "because its worker is wedged",
+                    path,
+                    CRAWL_FOLDER_TIMEOUT,
+                )
+                break
+            except Exception as exc:
+                snapshot.complete = False
+                snapshot.failed_folders.append(path)
+                self.logger.error("Failed to enumerate %s: %s", path, exc)
+                continue
+
+            for child in children:
+                child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
+                meta = self._node_to_meta(
+                    child,
+                    child_path,
+                    inherited_shareid=node.data.get("shareID") or inherited_shareid,
+                )
+                if meta.get("remote_shareid") and not child.data.get("shareID"):
+                    child.data = {**child.data, "shareID": meta["remote_shareid"]}
+                snapshot[meta["remote_drivewsid"]] = meta
+                if self._is_directory_type(meta["type"]):
+                    # If sync_paths is set, only recurse into directories that are
+                    # on the path to or inside a sync_path. This avoids crawling
+                    # the entire iCloud Drive when only /Downloads is needed.
+                    if self.sync_paths is not None:
+                        should_recurse = False
+                        for sp in self.sync_paths:
+                            sp = sp.rstrip("/")
+                            cp = child_path.rstrip("/")
+                            # Recurse if child is a prefix of sync_path (ancestor)
+                            # or if child is inside sync_path (descendant)
+                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
+                                should_recurse = True
+                                break
+                        if not should_recurse:
+                            continue
+                    queue.append((child, child_path, meta.get("remote_shareid")))
+
+            now = time.time()
+            if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
+                self.logger.info(
+                    "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
+                    scanned_folders,
+                    len(snapshot),
+                    len(queue),
+                )
+                last_progress_log = now
 
         self.logger.info(
             "Remote metadata crawl complete: %s entries across %s folders in %.1fs%s",

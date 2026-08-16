@@ -48,6 +48,53 @@ class NoUnboundedReadStream(io.BytesIO):
         return super().read(size)
 
 
+class FakeCrawlNode:
+    def __init__(self, name, drivewsid, children=None, error=None, block_event=None):
+        self.name = name
+        self.data = {
+            "type": "FOLDER",
+            "drivewsid": drivewsid,
+            "docwsid": f"doc-{drivewsid}",
+            "etag": f"etag-{drivewsid}",
+            "zone": "zone-1",
+            "dateModified": "2026-04-06T00:00:00Z",
+        }
+        self.children = children or []
+        self.error = error
+        self.block_event = block_event
+        self.started = threading.Event()
+        self.get_children_calls = 0
+
+    def get_children(self, force=False):
+        self.get_children_calls += 1
+        self.started.set()
+        if self.block_event is not None:
+            self.block_event.wait()
+        if self.error is not None:
+            raise self.error
+        return self.children
+
+
+class ImmediateCrawlExecutor:
+    """Runs ordinary folders synchronously but leaves wedged folders running."""
+
+    def __init__(self, *args, **kwargs):
+        self.shutdown = Mock()
+        self.threads = []
+
+    def submit(self, callback, *args):
+        node = callback.__self__
+        future = Mock()
+        if node.block_event is not None:
+            thread = threading.Thread(target=callback, args=args, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+            future.result.side_effect = TimeoutError()
+        else:
+            future.result.side_effect = lambda timeout: callback(*args)
+        return future
+
+
 class DriverStateTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
@@ -55,6 +102,7 @@ class DriverStateTests(unittest.TestCase):
         self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
 
     def tearDown(self):
+        self.state.close()
         shutil.rmtree(self.root)
 
     def test_mirror_read_write_truncate(self):
@@ -599,6 +647,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._reconcile_persistent_cache = Mock()
 
     def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
         shutil.rmtree(self.root)
 
     def test_start_uses_persistent_cache_without_initial_scan(self):
@@ -796,7 +846,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertIsNone(self.state.get_entry("/gone.txt"))
         self.assertFalse(self.mirror.exists("/gone.txt"))
 
-    def test_crawl_shuts_down_its_executor(self):
+    def test_crawl_executor_is_shutdown_with_engine(self):
         future = Mock()
         future.result.return_value = []
         crawl_executor = Mock()
@@ -808,6 +858,8 @@ class SyncEngineStartupTests(unittest.TestCase):
         with patch("driver.ThreadPoolExecutor", return_value=crawl_executor):
             self.engine._crawl_remote_snapshot()
 
+        crawl_executor.shutdown.assert_not_called()
+        self.engine.shutdown()
         crawl_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
 
     def test_materialize_remote_entry_treats_app_library_as_directory(self):
@@ -905,6 +957,98 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+
+class CrawlExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.logger = Mock()
+        self.api = Mock()
+        self.api.drive = Mock()
+        self.engine = ICloudSyncEngine(self.api, self.mirror, self.state, self.logger)
+        self.block_events = []
+
+    def tearDown(self):
+        for event in self.block_events:
+            event.set()
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def test_wedged_folder_stops_crawl_before_later_folders(self):
+        release_wedged_folder = threading.Event()
+        self.block_events.append(release_wedged_folder)
+        wedged_folder = FakeCrawlNode(
+            "wedged",
+            "wedged-folder",
+            block_event=release_wedged_folder,
+        )
+        later_folder = FakeCrawlNode("later", "later-folder")
+        self.api.drive.root = FakeCrawlNode(
+            "root",
+            "root",
+            children=[wedged_folder, later_folder],
+        )
+
+        with patch("driver.CRAWL_FOLDER_TIMEOUT", 0.01):
+            snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertTrue(wedged_folder.started.wait(timeout=1))
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(snapshot.failed_folders, ["/wedged"])
+        self.assertEqual(later_folder.get_children_calls, 0)
+
+    def test_folder_exception_continues_with_durable_executor(self):
+        failed_folder = FakeCrawlNode(
+            "failed",
+            "failed-folder",
+            error=RuntimeError("remote metadata error"),
+        )
+        later_folder = FakeCrawlNode("later", "later-folder")
+        self.api.drive.root = FakeCrawlNode(
+            "root",
+            "root",
+            children=[failed_folder, later_folder],
+        )
+
+        snapshot = self.engine._crawl_remote_snapshot()
+
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(snapshot.failed_folders, ["/failed"])
+        self.assertEqual(later_folder.get_children_calls, 1)
+        self.assertIsNotNone(self.engine._crawl_executor)
+
+    def test_reuses_healthy_executor_and_replaces_suspect_executor(self):
+        executors = [ImmediateCrawlExecutor() for _ in range(4)]
+        executor_factory = Mock(side_effect=executors)
+        healthy_root = FakeCrawlNode("root", "root")
+        release_wedged_folder = threading.Event()
+        self.block_events.append(release_wedged_folder)
+        wedged_root = FakeCrawlNode(
+            "root",
+            "root",
+            block_event=release_wedged_folder,
+        )
+
+        with patch("driver.ThreadPoolExecutor", executor_factory):
+            self.api.drive.root = healthy_root
+            self.engine._crawl_remote_snapshot()
+            healthy_executor = self.engine._crawl_executor
+
+            self.engine._crawl_remote_snapshot()
+            self.assertIs(self.engine._crawl_executor, healthy_executor)
+            self.assertEqual(executor_factory.call_count, 1)
+
+            self.api.drive.root = wedged_root
+            snapshot = self.engine._crawl_remote_snapshot()
+            self.assertFalse(snapshot.complete)
+
+            self.api.drive.root = healthy_root
+            self.engine._crawl_remote_snapshot()
+            self.assertIsNot(self.engine._crawl_executor, healthy_executor)
+            self.assertEqual(executor_factory.call_count, 2)
 
 
 class DurableSyncQueueTests(unittest.TestCase):
