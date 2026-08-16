@@ -1030,6 +1030,88 @@ class DurableSyncQueueTests(unittest.TestCase):
         self.assertIsNotNone(entry["sync_next_attempt_at"])
         self.assertEqual(entry["sync_last_error"], "expired session")
 
+    def test_preupload_delete_not_found_uploads_replacement(self):
+        self.mirror.write("/replaced.txt", b"replacement", 0)
+        self._add_entry("/replaced.txt", remote_drivewsid="file-1")
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock()
+        self.engine._node_from_entry = Mock()
+        self.engine._delete_remote_node = Mock(
+            side_effect=PyiCloudAPIResponseException("not found", 404)
+        )
+        self.engine._reconcile_child_meta = Mock(return_value={})
+
+        self.engine._sync_file(self.state.get_entry("/replaced.txt"))
+
+        self.engine._delete_remote_node.assert_called_once()
+        parent.upload.assert_called_once()
+        self.assertFalse(self.state.get_entry("/replaced.txt")["dirty"])
+        self.logger.info.assert_called_once_with(
+            "Remote path %s was already deleted; uploading replacement",
+            "/replaced.txt",
+        )
+
+    def test_preupload_delete_failures_are_durable_and_skip_upload(self):
+        failures = (
+            ("timeout", Timeout("request timed out")),
+            (
+                "server error",
+                PyiCloudAPIResponseException("server error", 500),
+            ),
+        )
+
+        for name, failure in failures:
+            with self.subTest(name=name):
+                path = f"/{name}.txt"
+                self.mirror.write(path, b"content", 0)
+                self._add_entry(path, remote_drivewsid=f"file-{name}")
+                parent = Mock()
+                parent.data = {}
+                self.engine._ensure_remote_parent = Mock(return_value=parent)
+                self.engine.ensure_local_file = Mock()
+                self.engine._node_from_entry = Mock()
+                self.engine._delete_remote_node = Mock(side_effect=failure)
+
+                self.engine._sync_file(self.state.get_entry(path))
+
+                entry = self.state.get_entry(path)
+                parent.upload.assert_not_called()
+                self.assertEqual(entry["dirty"], 1)
+                self.assertEqual(entry["sync_attempt_count"], 1)
+                self.assertIn(
+                    path,
+                    [
+                        item["path"]
+                        for item in self.state.list_dirty_entries(include_deferred=True)
+                    ],
+                )
+
+    def test_preupload_delete_auth_failure_aborts_sync_pass_without_retry(self):
+        for path in ("/first.txt", "/second.txt"):
+            self.mirror.write(path, b"content", 0)
+            self._add_entry(path, remote_drivewsid=f"file-{path}")
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock()
+        self.engine._node_from_entry = Mock()
+        self.engine._delete_remote_node = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+
+        self.engine.sync_dirty_entries()
+
+        self.engine._delete_remote_node.assert_called_once()
+        parent.upload.assert_not_called()
+        first = self.state.get_entry("/first.txt")
+        second = self.state.get_entry("/second.txt")
+        self.assertEqual(first["sync_attempt_count"], 0)
+        self.assertIsNotNone(first["sync_next_attempt_at"])
+        self.assertEqual(second["sync_attempt_count"], 0)
+        self.assertTrue(second["dirty"])
+
     def test_restart_preserves_auth_sync_deferral(self):
         self.mirror.write("/queued.txt", b"content", 0)
         self._add_entry("/queued.txt")

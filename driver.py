@@ -2126,8 +2126,13 @@ class ICloudSyncEngine:
                 if entry["remote_drivewsid"]:
                     try:
                         self._delete_remote_node(self._node_from_entry(entry))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if not remote_item_is_absent(exc, "delete"):
+                            raise
+                        self.logger.info(
+                            "Remote path %s was already deleted; uploading replacement",
+                            entry["path"],
+                        )
 
                 with open(self.mirror.local_path(entry["path"]), "rb") as handle:
                     stream = NamedFileStream(handle, os.path.basename(entry["path"]))
