@@ -36,6 +36,7 @@ from pyicloud.exceptions import (
     PyiCloudAuthRequiredException,
     PyiCloudFailedLoginException,
 )
+import queue_diagnostic
 from queue_diagnostic import open_read_only
 import queue_recovery
 
@@ -557,6 +558,30 @@ class PyiCloudSessionTimeoutTests(unittest.TestCase):
             classify_sync_failure(Timeout("request timed out"), "download"),
             SYNC_FAILURE_TRANSIENT,
         )
+
+    def test_wraps_api_session_before_accessing_drive(self):
+        class Session:
+            def __init__(self):
+                self.request = Mock()
+
+        class Api:
+            def __init__(self):
+                self.session = Session()
+                self.original_request = self.session.request
+                self.drive_session_was_wrapped = None
+                self._drive = type("Drive", (), {"session": self.session})()
+
+            @property
+            def drive(self):
+                self.drive_session_was_wrapped = (
+                    self.session.request is not self.original_request
+                )
+                return self._drive
+
+        api = Api()
+
+        self.assertTrue(install_pyi_cloud_session_timeouts(api, Mock()))
+        self.assertTrue(api.drive_session_was_wrapped)
 
 
 class SyncEngineStartupTests(unittest.TestCase):
@@ -1969,6 +1994,71 @@ class HydrationFailureFUSETests(unittest.TestCase):
 
         self.assertEqual(self.fs.read(path, 100, 0), b"local content")
         self.engine.ensure_local_file.assert_not_called()
+
+    def test_open_hydration_failure_records_pending_queue_entry(self):
+        path = "/offline.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-offline",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.fs._is_authenticated = Mock(return_value=True)
+        self.engine.ensure_local_file = Mock(side_effect=Timeout("offline"))
+
+        self.assertEqual(self.fs.open(path, os.O_RDONLY), -errno.EIO)
+
+        entry = self.state.get_entry(path)
+        self.assertEqual(entry["hydrate_attempt_count"], 1)
+        self.assertEqual(entry["hydrate_last_error"], "offline")
+        self.assertGreater(entry["hydrate_next_attempt_at"], int(time.time()))
+        report = queue_diagnostic.inspect_queue(self.state.db_path, self.root)
+        self.assertEqual(
+            [item["path"] for item in report["pending_hydration_retries"]],
+            [path],
+        )
+        self.assertIn("1 hydrate-pending", queue_diagnostic.queue_summary(report))
+
+    def test_open_auth_hydration_failure_is_queue_blocked_without_attempt(self):
+        path = "/expired-session.txt"
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "remote-expired",
+                "size": 10,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+        self.fs._is_authenticated = Mock(return_value=True)
+        self.engine.ensure_local_file = Mock(
+            side_effect=PyiCloudFailedLoginException("expired session")
+        )
+
+        self.assertEqual(self.fs.open(path, os.O_RDONLY), -errno.EIO)
+
+        entry = self.state.get_entry(path)
+        self.assertEqual(entry["hydrate_attempt_count"], 0)
+        self.assertEqual(entry["hydrate_last_error"], "expired session")
+        self.assertGreater(entry["hydrate_next_attempt_at"], int(time.time()))
+        report = queue_diagnostic.inspect_queue(self.state.db_path, self.root)
+        self.assertEqual(
+            [(item["path"], item["operation"]) for item in report["auth_blocked_entries"]],
+            [(path, "hydration")],
+        )
 
 
 if __name__ == "__main__":

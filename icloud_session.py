@@ -16,27 +16,17 @@ def _safe_getattr(obj, name):
 def install_pyi_cloud_session_timeouts(api, logger=None):
     """Set safe defaults for pyicloud requests without replacing explicit ones."""
     logger = logger or logging.getLogger(__name__)
-    sessions = []
-    for owner in (api, _safe_getattr(api, "drive")):
-        session = _safe_getattr(owner, "session")
-        if session is not None and all(session is not known for known in sessions):
-            sessions.append(session)
+    found_session = False
 
-    if not sessions:
-        logger.warning("Could not install pyicloud request timeouts: no session found")
-        return False
-
-    installed = False
-    for session in sessions:
+    def install_timeout_hook(session):
         request = _safe_getattr(session, "request")
         if not callable(request):
             logger.warning(
                 "Could not install pyicloud request timeouts: session has no request method"
             )
-            continue
+            return False
         if getattr(request, _TIMEOUT_HOOK_MARKER, False) is True:
-            installed = True
-            continue
+            return True
 
         def request_with_default_timeout(*args, _request=request, **kwargs):
             if kwargs.get("timeout") is None:
@@ -48,8 +38,24 @@ def install_pyi_cloud_session_timeouts(api, logger=None):
         setattr(request_with_default_timeout, _TIMEOUT_HOOK_MARKER, True)
         try:
             setattr(session, "request", request_with_default_timeout)
-            installed = True
+            return True
         except Exception as exc:
             logger.warning("Could not install pyicloud request timeouts: %s", exc)
+            return False
+
+    api_session = _safe_getattr(api, "session")
+    installed = False
+    if api_session is not None:
+        found_session = True
+        installed = install_timeout_hook(api_session)
+
+    drive = _safe_getattr(api, "drive")
+    drive_session = _safe_getattr(drive, "session")
+    if drive_session is not None and drive_session is not api_session:
+        found_session = True
+        installed = install_timeout_hook(drive_session) or installed
+
+    if not found_session:
+        logger.warning("Could not install pyicloud request timeouts: no session found")
 
     return installed

@@ -2635,6 +2635,32 @@ class ICloudFS(Fuse):
             return
         self.logger.log(level, "file-op %s", op)
 
+    def _record_foreground_hydration_failure(self, path, exc, operation):
+        try:
+            classification, attempt, exhausted = (
+                self.sync_engine._record_hydrate_failure(path, exc)
+            )
+        except Exception as record_exc:
+            self.logger.error(
+                "Failed hydrating on %s for %s: %s; "
+                "also failed recording durable hydration failure: %s",
+                operation,
+                path,
+                exc,
+                record_exc,
+            )
+            return
+        self.logger.error(
+            "Failed hydrating on %s for %s: %s; "
+            "recorded %s failure (attempt %s, exhausted=%s)",
+            operation,
+            path,
+            exc,
+            classification,
+            attempt,
+            exhausted,
+        )
+
     def _mutation_allowed(self, operation, *paths):
         if self.sync_engine is None:
             self._log_file_op(
@@ -2863,7 +2889,7 @@ class ICloudFS(Fuse):
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
-                self.logger.error("Failed hydrating on open for %s: %s", path, exc)
+                self._record_foreground_hydration_failure(path, exc, "open")
                 return -errno.EIO
         return 0
 
@@ -2899,15 +2925,19 @@ class ICloudFS(Fuse):
         if not entry or entry["type"] != "file" or entry["tombstone"]:
             return -errno.ENOENT
 
-        try:
-            if not entry["hydrated"] and entry["remote_drivewsid"]:
-                if self.sync_engine is None:
-                    # No session — cannot hydrate; if placeholder exists it has no data
-                    self.logger.warning(
-                        "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
-                    )
-                    return -errno.EIO
+        if not entry["hydrated"] and entry["remote_drivewsid"]:
+            if self.sync_engine is None:
+                # No session — cannot hydrate; if placeholder exists it has no data
+                self.logger.warning(
+                    "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
+                )
+                return -errno.EIO
+            try:
                 self.sync_engine.ensure_local_file(path)
+            except Exception as exc:
+                self._record_foreground_hydration_failure(path, exc, "read")
+                return -errno.EIO
+        try:
             self._log_file_op("read", path, level=logging.DEBUG, size=size, offset=offset)
             return self.mirror.read(path, size, offset)
         except Exception as exc:
@@ -2924,7 +2954,7 @@ class ICloudFS(Fuse):
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
-                self.logger.error("Failed hydrating before write %s: %s", path, exc)
+                self._record_foreground_hydration_failure(path, exc, "write")
                 return -errno.EIO
 
         try:
@@ -3085,7 +3115,7 @@ class ICloudFS(Fuse):
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
-                self.logger.error("Failed hydrating before truncate %s: %s", path, exc)
+                self._record_foreground_hydration_failure(path, exc, "truncate")
                 return -errno.EIO
 
         try:
