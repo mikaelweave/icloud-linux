@@ -6,7 +6,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from requests.models import RequestEncodingMixin
 
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
@@ -515,6 +515,33 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(upload_state["class_name"], "NamedFileStream")
         self.assertEqual(upload_state["name"], "a.txt")
         self.assertEqual(upload_state["prefix"], b"hello")
+
+
+class ICloudFSInitializationTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_init_icloud_limits_partition_request_timeout(self):
+        response = Mock()
+        response.headers = {"x-apple-user-partition": "1"}
+        api = Mock()
+        api.requires_2fa = False
+        api.requires_2sa = False
+
+        with patch("requests.post", return_value=response) as post:
+            with patch("driver.PyiCloudService", return_value=api):
+                self.fs.init_icloud("user", "password", self.root)
+
+        post.assert_called_once_with(
+            "https://setup.icloud.com/setup/ws/1/validate",
+            json={},
+            timeout=10,
+        )
 
 
 class ICloudFSPathPolicyTests(unittest.TestCase):

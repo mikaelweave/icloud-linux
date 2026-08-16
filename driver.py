@@ -2122,7 +2122,7 @@ class ICloudFS(Fuse):
         try:
             # Resolve Apple account partition (fixes 421 redirect for non-default shards)
             import requests as _req
-            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={}, timeout=10)
             _partition = _r.headers.get("x-apple-user-partition")
 
             self.api = PyiCloudService(username, password,
