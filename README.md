@@ -139,6 +139,11 @@ interactive session, but it does not keep the WSL VM alive; that requires both
 Keep `cache_dir` on the distro's ext4 filesystem, not under `/mnt/c`: DrvFs
 does not provide the locking SQLite WAL needs.
 
+All iCloud API requests use bounded connect/read timeouts. Streaming downloads
+allow a longer read inactivity interval, so large transfers continue normally
+while a dead WSL network connection can fail and retry instead of wedging the
+mount.
+
 Troubleshooting:
 
 - The mount is empty or permission-denied from Windows: enable both

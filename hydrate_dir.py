@@ -11,6 +11,7 @@ Usage:
 import hashlib, logging, os, sqlite3, sys, tempfile, shutil, time
 import yaml, requests as _req
 from pyicloud import PyiCloudService
+from icloud_session import install_pyi_cloud_session_timeouts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +47,7 @@ _r = _req.post(
 _partition = _r.headers.get("x-apple-user-partition")
 api = PyiCloudService(USERNAME, PASSWORD,
                       cookie_directory=COOKIE_DIR, authenticate=False)
+install_pyi_cloud_session_timeouts(api, log)
 if _partition:
     api._setup_endpoint = f"https://p{_partition}-setup.icloud.com/setup/ws/1"
 api.authenticate()

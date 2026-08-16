@@ -17,6 +17,8 @@ from driver import (
     ICloudFS,
     ICloudSyncEngine,
     LocalMirror,
+    CONTROL_PLANE_TIMEOUT,
+    DOWNLOAD_TIMEOUT,
     MAX_SYNC_ATTEMPTS,
     MissingMirrorFile,
     NamedFileStream,
@@ -25,6 +27,7 @@ from driver import (
     SYNC_FAILURE_TRANSIENT,
     SyncState,
     classify_sync_failure,
+    install_pyi_cloud_session_timeouts,
 )
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
@@ -511,6 +514,45 @@ class SyncFailureClassificationTests(unittest.TestCase):
                 )
 
 
+class PyiCloudSessionTimeoutTests(unittest.TestCase):
+    def test_session_hook_uses_defaults_without_overriding_explicit_timeouts(self):
+        api = type("Api", (), {})()
+        session = type("Session", (), {})()
+        original_request = Mock()
+        session.request = original_request
+        api.session = session
+        logger = Mock()
+
+        self.assertTrue(install_pyi_cloud_session_timeouts(api, logger))
+
+        session.request("GET", "https://example.invalid/control")
+        self.assertEqual(
+            original_request.call_args.kwargs["timeout"],
+            CONTROL_PLANE_TIMEOUT,
+        )
+
+        explicit_timeout = (1, 2)
+        session.request(
+            "GET",
+            "https://example.invalid/explicit",
+            timeout=explicit_timeout,
+        )
+        self.assertEqual(
+            original_request.call_args.kwargs["timeout"],
+            explicit_timeout,
+        )
+
+        session.request("GET", "https://example.invalid/download", stream=True)
+        self.assertEqual(
+            original_request.call_args.kwargs["timeout"],
+            DOWNLOAD_TIMEOUT,
+        )
+        self.assertEqual(
+            classify_sync_failure(Timeout("request timed out"), "download"),
+            SYNC_FAILURE_TRANSIENT,
+        )
+
+
 class SyncEngineStartupTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
@@ -663,6 +705,79 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(snapshot["folder-1"]["path"], "/Obsidian")
         self.assertEqual(snapshot["folder-1"]["type"], "app_library")
         self.assertEqual(snapshot["file-1"]["path"], "/Obsidian/vault.md")
+
+    def test_incomplete_crawl_does_not_prune_clean_cached_entries(self):
+        self.state.upsert_entry(
+            {
+                "path": "/still-remote.txt",
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-still-remote",
+                "size": 5,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/still-remote.txt",
+            }
+        )
+        self.mirror.write("/still-remote.txt", b"keep!", 0)
+        future = Mock()
+        future.result.side_effect = TimeoutError()
+        crawl_executor = Mock()
+        crawl_executor.submit.return_value = future
+
+        with patch("driver.ThreadPoolExecutor", return_value=crawl_executor):
+            snapshot = self.engine._crawl_remote_snapshot()
+
+        self.engine._apply_remote_snapshot(snapshot)
+
+        self.assertFalse(snapshot.complete)
+        self.assertEqual(snapshot.failed_folders, ["/"])
+        self.assertIsNotNone(self.state.get_entry("/still-remote.txt"))
+        self.assertTrue(self.mirror.exists("/still-remote.txt"))
+
+    def test_complete_crawl_prunes_clean_entries_deleted_remotely(self):
+        self.state.upsert_entry(
+            {
+                "path": "/gone.txt",
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-gone",
+                "size": 4,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/gone.txt",
+            }
+        )
+        self.mirror.write("/gone.txt", b"gone", 0)
+        root = Mock()
+        root.data = {}
+        root.get_children.return_value = []
+        self.engine.api.drive.root = root
+
+        snapshot = self.engine._crawl_remote_snapshot()
+        self.engine._apply_remote_snapshot(snapshot)
+
+        self.assertTrue(snapshot.complete)
+        self.assertIsNone(self.state.get_entry("/gone.txt"))
+        self.assertFalse(self.mirror.exists("/gone.txt"))
+
+    def test_crawl_shuts_down_its_executor(self):
+        future = Mock()
+        future.result.return_value = []
+        crawl_executor = Mock()
+        crawl_executor.submit.return_value = future
+        root = Mock()
+        root.data = {}
+        self.engine.api.drive.root = root
+
+        with patch("driver.ThreadPoolExecutor", return_value=crawl_executor):
+            self.engine._crawl_remote_snapshot()
+
+        crawl_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
 
     def test_materialize_remote_entry_treats_app_library_as_directory(self):
         self.engine._materialize_remote_entry(

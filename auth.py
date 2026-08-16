@@ -22,9 +22,11 @@ iOS 26 beta workaround:
 """
 import os
 import sys
+import logging
 import yaml
 import requests
 from pyicloud import PyiCloudService
+from icloud_session import install_pyi_cloud_session_timeouts
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
     PyiCloudAPIResponseException,
@@ -204,6 +206,7 @@ def main():
         cookie_directory=cookie_dir,
         authenticate=False,
     )
+    install_pyi_cloud_session_timeouts(api, logging.getLogger(__name__))
     if endpoint:
         api._setup_endpoint = endpoint
 
