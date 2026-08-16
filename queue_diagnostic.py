@@ -50,23 +50,53 @@ def _count(conn, query):
 
 
 def read_unrecorded_failures(cache_dir):
-    """Read valid fallback failure records without modifying their log."""
+    """Read fallback failure records, surfacing damaged ones rather than
+    dropping them.
+
+    This log is the last-resort visibility mechanism, used precisely when the
+    database could not be written. Silently skipping a truncated or corrupt
+    line would recreate the invisible stuck state it exists to prevent, so
+    unusable records are reported as unreadable instead of ignored.
+    """
     marker_path = os.path.join(cache_dir, UNRECORDED_FAILURES_FILENAME)
     try:
         with open(marker_path, encoding="utf-8", errors="replace") as handle:
             lines = handle.readlines()
     except FileNotFoundError:
         return []
-    except OSError:
-        return []
+    except OSError as exc:
+        return [
+            {
+                "path": None,
+                "operation": "unknown",
+                "error": f"fallback failure log could not be read: {exc}",
+                "record_error": None,
+                "damaged": True,
+            }
+        ]
 
     failures = []
-    for line in lines:
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        record = None
         try:
             record = json.loads(line)
         except (TypeError, ValueError):
-            continue
+            record = None
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            failures.append(
+                {
+                    "path": None,
+                    "operation": "unknown",
+                    "error": (
+                        f"unreadable fallback record on line {number}; a file may "
+                        "be stuck without appearing above"
+                    ),
+                    "record_error": None,
+                    "damaged": True,
+                }
+            )
             continue
         failures.append(
             {
@@ -74,6 +104,7 @@ def read_unrecorded_failures(cache_dir):
                 "operation": record.get("operation", "hydration"),
                 "error": record.get("error"),
                 "record_error": record.get("record_error"),
+                "damaged": False,
             }
         )
     return failures
@@ -613,6 +644,13 @@ def _print_unrecorded_failures(unrecorded_failures):
         "appearing in the normal categories."
     )
     for failure in unrecorded_failures:
+        if failure.get("damaged"):
+            print(f"  <unreadable record>: {_truncate_error(failure['error'])}")
+            print(
+                "    Remedy: this record cannot be attributed to a path. Check the "
+                "driver logs, then run: ./icloudctl retry"
+            )
+            continue
         print(
             f"  {failure['path']} ({failure['operation']}): "
             f"{_truncate_error(failure['error'])}"

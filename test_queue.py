@@ -459,6 +459,79 @@ class QueueDiagnosticTests(unittest.TestCase):
         with open(marker_path, encoding="utf-8") as handle:
             remaining = [json.loads(line)["path"] for line in handle if line.strip()]
         self.assertEqual(remaining, ["/keep.txt"])
+    def test_corrupt_marker_line_is_surfaced_not_skipped(self):
+        """The fallback log is the last-resort visibility mechanism, so a
+        damaged record must never be silently dropped."""
+        marker_path = os.path.join(
+            os.path.dirname(self.db_path),
+            queue_diagnostic.UNRECORDED_FAILURES_FILENAME,
+        )
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"path": "/good.txt"}) + "\n")
+            handle.write('{"path": "/trunc.txt", "operat\n')
+
+        failures = queue_diagnostic.read_unrecorded_failures(
+            os.path.dirname(self.db_path)
+        )
+
+        self.assertEqual(len(failures), 2)
+        damaged = [f for f in failures if f.get("damaged")]
+        self.assertEqual(len(damaged), 1)
+        self.assertIsNone(damaged[0]["path"])
+
+    def test_unreadable_marker_file_is_not_reported_as_none(self):
+        marker_path = os.path.join(
+            os.path.dirname(self.db_path),
+            queue_diagnostic.UNRECORDED_FAILURES_FILENAME,
+        )
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"path": "/x.txt"}) + "\n")
+
+        with unittest.mock.patch(
+            "builtins.open", side_effect=OSError("permission denied")
+        ):
+            failures = queue_diagnostic.read_unrecorded_failures(
+                os.path.dirname(self.db_path)
+            )
+
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0]["damaged"])
+
+    def test_only_global_retry_discards_an_unattributable_marker(self):
+        conn = self.create_db()
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sync_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN sync_last_error TEXT")
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN hydrate_attempt_count INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_next_attempt_at INTEGER")
+        conn.execute("ALTER TABLE entries ADD COLUMN hydrate_last_error TEXT")
+        conn.commit()
+        conn.close()
+        marker_path = os.path.join(
+            os.path.dirname(self.db_path),
+            queue_recovery.UNRECORDED_FAILURES_FILENAME,
+        )
+        corrupt = '{"path": "/trunc.txt", "operat\n'
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(corrupt)
+
+        # A targeted retry cannot attribute the record, so it must keep it.
+        _, _, removed = queue_recovery.clear_failures(self.db_path, "/trunc.txt")
+        self.assertEqual(removed, 0)
+        with open(marker_path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), corrupt)
+
+        # A global retry is an explicit reset, so it may clear it.
+        _, _, removed = queue_recovery.clear_failures(self.db_path)
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(marker_path))
 
 
 if __name__ == "__main__":

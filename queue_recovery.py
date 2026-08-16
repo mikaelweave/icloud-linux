@@ -71,11 +71,15 @@ def clear_unrecorded_failure_markers(cache_dir, path):
         try:
             record = json.loads(line)
         except (TypeError, ValueError):
-            remaining_lines.append(line)
+            record = None
+        if not isinstance(record, dict) or record.get("path") is None:
+            # A damaged record cannot be attributed to a path, so only a
+            # global retry - an explicit request to reset everything - may
+            # discard it. Otherwise it would be reported forever.
+            if path is not None:
+                remaining_lines.append(line)
             continue
-        if not isinstance(record, dict) or not path_in_subtree(
-            record.get("path"), path
-        ):
+        if not path_in_subtree(record.get("path"), path):
             remaining_lines.append(line)
 
     if len(remaining_lines) == len(lines):
