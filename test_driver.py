@@ -16,6 +16,7 @@ from requests.exceptions import ConnectionError, Timeout
 from requests.models import RequestEncodingMixin
 from urllib3.response import HTTPResponse
 
+import driver
 from driver import (
     ICloudFS,
     ICloudSyncEngine,
@@ -989,6 +990,35 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(snapshot["folder-1"]["path"], "/Obsidian")
         self.assertEqual(snapshot["folder-1"]["type"], "app_library")
         self.assertEqual(snapshot["file-1"]["path"], "/Obsidian/vault.md")
+
+    def test_crawl_uses_visibility_policy_for_sync_path_ancestors_and_descendants(self):
+        work_notes = FakeCrawlNode("Work Notes", "work-notes")
+        personal = FakeCrawlNode("Mikael Personal", "personal")
+        obsidian = FakeCrawlNode(
+            "Obsidian",
+            "obsidian",
+            children=[work_notes, personal],
+        )
+        documents = FakeCrawlNode("Documents", "documents")
+        self.engine.api.drive.root = FakeCrawlNode(
+            "root",
+            "root",
+            children=[obsidian, documents],
+        )
+        self.engine.sync_paths = ["/Obsidian/Work Notes"]
+
+        with patch("driver.path_visible", wraps=driver.path_visible) as visible:
+            self.engine._crawl_remote_snapshot()
+
+        visible.assert_any_call(
+            "/Documents",
+            ["/Obsidian/Work Notes"],
+            [],
+        )
+        self.assertEqual(obsidian.get_children_calls, 1)
+        self.assertEqual(work_notes.get_children_calls, 1)
+        self.assertEqual(personal.get_children_calls, 0)
+        self.assertEqual(documents.get_children_calls, 0)
 
     def test_incomplete_crawl_does_not_prune_clean_cached_entries(self):
         self.state.upsert_entry(
@@ -2102,6 +2132,137 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
             self.assertTrue(engine._path_allowed("/outside/file.txt"))
         finally:
             engine.shutdown()
+
+
+class ICloudFSVisibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            sync_paths=["/Obsidian/Work Notes"],
+        )
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.api = self.api
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = self.engine
+        self.fs.mount_uid = os.getuid()
+        self.fs.mount_gid = os.getgid()
+        self.fs.file_mode = 0o644
+        self.fs.dir_mode = 0o755
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def _add_entry(self, path, entry_type="file", content=b"content", hydrated=True):
+        if entry_type == "folder":
+            self.mirror.ensure_dir(path)
+        elif hydrated:
+            self.mirror.write(path, content, 0)
+        else:
+            self.mirror.materialize_placeholder(path, len(content), 123)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": entry_type,
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": f"remote-{path}",
+                "size": len(content) if entry_type == "file" else 0,
+                "mtime": int(stats.st_mtime),
+                "hydrated": hydrated,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+
+    def _populate_scope_tree(self):
+        self._add_entry("/Obsidian", "folder")
+        self._add_entry("/Obsidian/Work Notes", "folder")
+        self._add_entry("/Obsidian/Work Notes/note.md")
+        self._add_entry("/Obsidian/Mikael Personal", "folder")
+        self._add_entry("/Documents", "folder")
+
+    def test_readdir_hides_out_of_scope_entries_but_keeps_sync_ancestors(self):
+        self._populate_scope_tree()
+
+        self.assertEqual(
+            [entry.name for entry in self.fs.readdir("/", 0)],
+            [".", "..", "Obsidian"],
+        )
+        self.assertEqual(
+            [entry.name for entry in self.fs.readdir("/Obsidian", 0)],
+            [".", "..", "Work Notes"],
+        )
+
+    def test_getattr_hides_out_of_scope_entries_but_keeps_ancestors_and_scope(self):
+        self._populate_scope_tree()
+
+        self.assertEqual(self.fs.getattr("/Documents"), -errno.ENOENT)
+        self.assertEqual(self.fs.getattr("/Obsidian/Mikael Personal"), -errno.ENOENT)
+        self.assertNotEqual(self.fs.getattr("/Obsidian"), -errno.ENOENT)
+        self.assertNotEqual(
+            self.fs.getattr("/Obsidian/Work Notes/note.md"),
+            -errno.ENOENT,
+        )
+
+    def test_reading_out_of_scope_placeholder_returns_eio_not_zero_bytes(self):
+        path = "/Documents/placeholder.txt"
+        self._add_entry("/Documents", "folder")
+        self._add_entry(path, content=b"expected", hydrated=False)
+        self.engine.ensure_local_file = Mock()
+
+        self.assertEqual(self.fs.read(path, 256, 0), -errno.EIO)
+        self.engine.ensure_local_file.assert_not_called()
+
+    def test_reading_still_unhydrated_remote_file_returns_eio(self):
+        path = "/Obsidian/Work Notes/placeholder.txt"
+        self._add_entry("/Obsidian", "folder")
+        self._add_entry("/Obsidian/Work Notes", "folder")
+        self._add_entry(path, content=b"expected", hydrated=False)
+        self.engine.ensure_local_file = Mock()
+
+        self.assertEqual(self.fs.read(path, 256, 0), -errno.EIO)
+        self.engine.ensure_local_file.assert_called_once_with(path)
+
+    def test_excluded_paths_are_hidden(self):
+        self.engine.shutdown()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            exclude_paths=["/Obsidian/Work Notes/private"],
+        )
+        self.fs.sync_engine = self.engine
+        self._add_entry("/Obsidian", "folder")
+        self._add_entry("/Obsidian/Work Notes", "folder")
+        self._add_entry("/Obsidian/Work Notes/private", "folder")
+
+        self.assertEqual(
+            self.fs.getattr("/Obsidian/Work Notes/private"),
+            -errno.ENOENT,
+        )
+
+    def test_unrestricted_sync_paths_do_not_hide_entries(self):
+        self.engine.shutdown()
+        self.engine = ICloudSyncEngine(self.api, self.mirror, self.state, Mock())
+        self.fs.sync_engine = self.engine
+        self._add_entry("/Documents", "folder")
+
+        self.assertIn("Documents", [entry.name for entry in self.fs.readdir("/", 0)])
+        self.assertNotEqual(self.fs.getattr("/Documents"), -errno.ENOENT)
 
 
 class DurableHydrationQueueTests(unittest.TestCase):

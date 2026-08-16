@@ -175,6 +175,26 @@ def path_allowed(path, sync_paths, exclude_paths):
     )
 
 
+def path_visible(path, sync_paths, exclude_paths):
+    """Return whether a path should be exposed through the mounted filesystem."""
+    path = normalize_icloud_path(path)
+    if path == "/":
+        return True
+
+    for prefix in exclude_paths:
+        if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+            return False
+
+    if sync_paths is None or path_allowed(path, sync_paths, exclude_paths):
+        return True
+
+    # Keep sync-path ancestors visible so callers can navigate into the scope.
+    return any(
+        prefix.startswith(path.rstrip("/") + "/")
+        for prefix in sync_paths
+    )
+
+
 class Stat(fuse.Stat):
     def __init__(self):
         self.st_mode = 0
@@ -1631,21 +1651,12 @@ class ICloudSyncEngine:
                     child.data = {**child.data, "shareID": meta["remote_shareid"]}
                 snapshot[meta["remote_drivewsid"]] = meta
                 if self._is_directory_type(meta["type"]):
-                    # If sync_paths is set, only recurse into directories that are
-                    # on the path to or inside a sync_path. This avoids crawling
-                    # the entire iCloud Drive when only /Downloads is needed.
-                    if self.sync_paths is not None:
-                        should_recurse = False
-                        for sp in self.sync_paths:
-                            sp = sp.rstrip("/")
-                            cp = child_path.rstrip("/")
-                            # Recurse if child is a prefix of sync_path (ancestor)
-                            # or if child is inside sync_path (descendant)
-                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
-                                should_recurse = True
-                                break
-                        if not should_recurse:
-                            continue
+                    if not path_visible(
+                        child_path,
+                        self.sync_paths,
+                        self.exclude_paths,
+                    ):
+                        continue
                     queue.append((child, child_path, meta.get("remote_shareid")))
 
             now = time.time()
@@ -2833,6 +2844,16 @@ class ICloudFS(Fuse):
         )
         return False
 
+    def _path_visible(self, path):
+        """Return whether a path is safe to expose before sync initialization."""
+        if self.sync_engine is None:
+            return True
+        return path_visible(
+            path,
+            self.sync_engine.sync_paths,
+            self.sync_engine.exclude_paths,
+        )
+
     def shutdown(self):
         if self.sync_engine is not None:
             self.sync_engine.shutdown()
@@ -2984,6 +3005,9 @@ class ICloudFS(Fuse):
                 attrs.st_atime = now
             return attrs
 
+        if not self._path_visible(path):
+            return -errno.ENOENT
+
         if self.mirror and self.mirror.exists(path):
             stats = self.mirror.stat_local(path)
             self._apply_os_stat(attrs, stats)
@@ -3011,7 +3035,12 @@ class ICloudFS(Fuse):
         self._log_file_op("readdir", path, level=logging.DEBUG)
         entries = [".", ".."] + sorted(self.mirror.listdir(path))
         for entry in entries:
-            yield fuse.Direntry(entry)
+            if entry in {".", ".."}:
+                yield fuse.Direntry(entry)
+                continue
+            child_path = "/" + entry if path == "/" else path.rstrip("/") + "/" + entry
+            if self._path_visible(child_path):
+                yield fuse.Direntry(entry)
 
     def open(self, path, flags):
         self._log_file_op("open", path, level=logging.DEBUG, flags=flags)
@@ -3084,10 +3113,24 @@ class ICloudFS(Fuse):
                     "Cannot hydrate %s: no iCloud session. Run './icloudctl auth' then restart.", path
                 )
                 return -errno.EIO
+            if not self.sync_engine._path_allowed(path):
+                self.logger.warning(
+                    "Refusing to serve non-hydrated remote file outside the configured "
+                    "sync scope: %s",
+                    path,
+                )
+                return -errno.EIO
             try:
                 self.sync_engine.ensure_local_file(path)
             except Exception as exc:
                 self._record_foreground_hydration_failure(path, exc, "read")
+                return -errno.EIO
+            entry = self.state.get_entry(path)
+            if entry and not entry["hydrated"] and entry["remote_drivewsid"]:
+                self.logger.error(
+                    "Refusing to serve unhydrated remote file after hydration attempt: %s",
+                    path,
+                )
                 return -errno.EIO
         try:
             self._log_file_op("read", path, level=logging.DEBUG, size=size, offset=offset)
