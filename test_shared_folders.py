@@ -14,7 +14,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import fuse
 from requests import Response
@@ -231,7 +231,7 @@ class SharedFolderEngineTests(unittest.TestCase):
                 "remote_zone": "zone-1",
                 "remote_shareid": shareid,
                 "remote_itemid": "item-shared",
-                "size": 13,
+                "size": 14,
                 "mtime": 123,
                 "hydrated": False,
                 "dirty": False,
@@ -273,6 +273,10 @@ class SharedFolderEngineTests(unittest.TestCase):
         first_call = self.engine.api.drive.session.get.call_args_list[0]
         self.assertTrue(first_call.args[0].endswith("/v1/item/item-shared"))
         self.assertEqual(first_call.kwargs["timeout"], (10, 60))
+        self.assertEqual(
+            self.engine.api.drive._raise_if_error.call_args_list,
+            [call(meta_response), call(response)],
+        )
         second_call = self.engine.api.drive.session.get.call_args_list[1]
         self.assertEqual(second_call.args[0], "https://download.example/shared-a.txt")
         self.assertEqual(second_call.kwargs["timeout"], (10, 300))

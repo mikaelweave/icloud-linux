@@ -33,6 +33,10 @@ from pyicloud.exceptions import (
 )
 from pyicloud.services.drive import DriveNode
 
+from failure_markers import (
+    UNRECORDED_FAILURES_FILENAME,
+    exclusive_failure_marker_lock,
+)
 from icloud_session import (
     CONTROL_PLANE_TIMEOUT,
     DOWNLOAD_TIMEOUT,
@@ -361,6 +365,8 @@ class SyncState:
                     hydrate_last_error TEXT,
                     failed INTEGER NOT NULL DEFAULT 0,
                     local_sha256 TEXT,
+                    local_mtime_ns INTEGER,
+                    local_ctime_ns INTEGER,
                     last_synced_at INTEGER,
                     synced_path TEXT
                 );
@@ -405,6 +411,14 @@ class SyncState:
             if "failed" not in columns:
                 self.conn.execute(
                     "ALTER TABLE entries ADD COLUMN failed INTEGER NOT NULL DEFAULT 0"
+                )
+            if "local_mtime_ns" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN local_mtime_ns INTEGER"
+                )
+            if "local_ctime_ns" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN local_ctime_ns INTEGER"
                 )
             self.conn.execute("DROP TABLE IF EXISTS pending_ops")
             dirty_index_columns = [
@@ -455,6 +469,8 @@ class SyncState:
             "dirty": int(bool(entry.get("dirty", False))),
             "tombstone": int(bool(entry.get("tombstone", False))),
             "local_sha256": entry.get("local_sha256"),
+            "local_mtime_ns": entry.get("local_mtime_ns"),
+            "local_ctime_ns": entry.get("local_ctime_ns"),
             "last_synced_at": entry.get("last_synced_at"),
             "synced_path": entry.get("synced_path", entry["path"]),
         }
@@ -465,12 +481,12 @@ class SyncState:
                     path, type, parent_path, remote_drivewsid, remote_docwsid, remote_etag,
                     remote_zone, remote_shareid, remote_itemid, remote_unified_token,
                     size, mtime, hydrated, dirty, tombstone, local_sha256,
-                    last_synced_at, synced_path
+                    local_mtime_ns, local_ctime_ns, last_synced_at, synced_path
                 ) VALUES (
                     :path, :type, :parent_path, :remote_drivewsid, :remote_docwsid, :remote_etag,
                     :remote_zone, :remote_shareid, :remote_itemid, :remote_unified_token,
                     :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
-                    :last_synced_at, :synced_path
+                    :local_mtime_ns, :local_ctime_ns, :last_synced_at, :synced_path
                 )
                 ON CONFLICT(path) DO UPDATE SET
                     type = excluded.type,
@@ -488,6 +504,8 @@ class SyncState:
                     dirty = excluded.dirty,
                     tombstone = excluded.tombstone,
                     local_sha256 = excluded.local_sha256,
+                    local_mtime_ns = excluded.local_mtime_ns,
+                    local_ctime_ns = excluded.local_ctime_ns,
                     last_synced_at = excluded.last_synced_at,
                     synced_path = excluded.synced_path
                 """,
@@ -753,7 +771,15 @@ class SyncState:
             ).fetchone()
         return int(row["count"])
 
-    def mark_hydrated(self, path, local_sha256=None, size=None, mtime=None):
+    def mark_hydrated(
+        self,
+        path,
+        local_sha256=None,
+        size=None,
+        mtime=None,
+        local_mtime_ns=None,
+        local_ctime_ns=None,
+    ):
         with self.lock:
             self.conn.execute(
                 """
@@ -764,10 +790,19 @@ class SyncState:
                     hydrate_last_error = NULL,
                     local_sha256 = COALESCE(?, local_sha256),
                     size = COALESCE(?, size),
-                    mtime = COALESCE(?, mtime)
+                    mtime = COALESCE(?, mtime),
+                    local_mtime_ns = COALESCE(?, local_mtime_ns),
+                    local_ctime_ns = COALESCE(?, local_ctime_ns)
                 WHERE path = ?
                 """,
-                (local_sha256, size, mtime, path),
+                (
+                    local_sha256,
+                    size,
+                    mtime,
+                    local_mtime_ns,
+                    local_ctime_ns,
+                    path,
+                ),
             )
             self.conn.commit()
 
@@ -1434,12 +1469,23 @@ class ICloudSyncEngine:
                 hydrated = bool(entry["hydrated"])
                 if entry["type"] == "file" and (hydrated or not entry["remote_drivewsid"]):
                     hydrated = True
-                    # Only recompute the SHA256 if size or mtime changed since
-                    # the last recorded sync — reading every file on startup is
-                    # the cause of the 4-minute / 11 GB memory blowup at boot.
+                    local_mtime_ns = stats.st_mtime_ns
+                    local_ctime_ns = stats.st_ctime_ns
                     size_changed = stats.st_size != int(entry.get("size") or 0)
-                    mtime_changed = int(stats.st_mtime) != int(entry.get("mtime") or 0)
-                    if size_changed or mtime_changed or not checksum:
+                    timestamp_changed = (
+                        entry.get("local_mtime_ns") != local_mtime_ns
+                        or entry.get("local_ctime_ns") != local_ctime_ns
+                    )
+                    timestamps_are_coarse = (
+                        local_mtime_ns % 1_000_000_000 == 0
+                        and local_ctime_ns % 1_000_000_000 == 0
+                    )
+                    if (
+                        size_changed
+                        or timestamp_changed
+                        or timestamps_are_coarse
+                        or not checksum
+                    ):
                         checksum = self.mirror.file_sha256(path)
                         if (
                             entry.get("local_sha256")
@@ -1460,6 +1506,8 @@ class ICloudSyncEngine:
                         "mtime": int(stats.st_mtime),
                         "hydrated": hydrated,
                         "local_sha256": checksum,
+                        "local_mtime_ns": stats.st_mtime_ns,
+                        "local_ctime_ns": stats.st_ctime_ns,
                     }
                 )
                 continue
@@ -1479,6 +1527,8 @@ class ICloudSyncEngine:
                         "mtime": int(stats.st_mtime),
                         "hydrated": True,
                         "local_sha256": checksum,
+                        "local_mtime_ns": stats.st_mtime_ns,
+                        "local_ctime_ns": stats.st_ctime_ns,
                     }
                 )
 
@@ -1520,7 +1570,14 @@ class ICloudSyncEngine:
                     self.mirror.create_file(path)
                 checksum = self.mirror.file_sha256(path)
                 stats = self.mirror.stat_local(path)
-                self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+                self.state.mark_hydrated(
+                    path,
+                    checksum,
+                    stats.st_size,
+                    int(stats.st_mtime),
+                    stats.st_mtime_ns,
+                    stats.st_ctime_ns,
+                )
                 self._log_sync(
                     "hydrate-complete",
                     level=logging.INFO,
@@ -1549,6 +1606,7 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(self._open_remote_file(node, entry, path, stream=True)) as response:
+                    response.raise_for_status()
                     # iter_content replays requests' cached body if pyicloud already
                     # consumed it while attempting to decode a JSON response.
                     written = self.mirror.write_atomic_stream(
@@ -1556,34 +1614,18 @@ class ICloudSyncEngine:
                         response.iter_content(chunk_size=IO_CHUNK_SIZE),
                         entry["mtime"],
                     )
-                    headers = getattr(response, "headers", {}) or {}
-                    content_encoding = headers.get("Content-Encoding")
                     try:
-                        expected_size = int(headers.get("Content-Length"))
+                        expected_size = int(entry["size"])
                         if expected_size < 0:
-                            expected_size = None
+                            raise ValueError("negative metadata size")
                     except (TypeError, ValueError):
                         expected_size = None
-                    try:
-                        entry_size = int(entry.get("size") or 0)
-                    except (TypeError, ValueError):
-                        entry_size = 0
 
-                    if content_encoding:
-                        truncated = entry_size > 0 and written == 0
-                        expected_for_log = entry_size
-                    elif expected_size is not None:
-                        truncated = written != expected_size
-                        expected_for_log = expected_size
-                    else:
-                        truncated = entry_size > 0 and written == 0
-                        expected_for_log = entry_size
-
-                    if truncated:
+                    if expected_size is not None and written != expected_size:
                         self.logger.error(
                             "Hydration truncated path=%s expected_bytes=%s actual_bytes=%s",
                             path,
-                            expected_for_log,
+                            expected_size,
                             written,
                         )
                         try:
@@ -1593,13 +1635,20 @@ class ICloudSyncEngine:
                         raise HydrationTruncated(
                             "truncated download for {}: expected {} bytes, got {}".format(
                                 path,
-                                expected_for_log,
+                                expected_size,
                                 written,
                             )
                         )
             stats = self.mirror.stat_local(path)
             checksum = self.mirror.file_sha256(path)
-            self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+            self.state.mark_hydrated(
+                path,
+                checksum,
+                stats.st_size,
+                int(stats.st_mtime),
+                stats.st_mtime_ns,
+                stats.st_ctime_ns,
+            )
             self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)
 
     def _crawl_remote_snapshot(self):
@@ -1767,6 +1816,8 @@ class ICloudSyncEngine:
                     "dirty": False,
                     "tombstone": False,
                     "local_sha256": entry.get("local_sha256") if entry else None,
+                    "local_mtime_ns": entry.get("local_mtime_ns") if entry else None,
+                    "local_ctime_ns": entry.get("local_ctime_ns") if entry else None,
                     "last_synced_at": entry.get("last_synced_at") if entry else None,
                     "synced_path": newpath,
                 }
@@ -1797,6 +1848,12 @@ class ICloudSyncEngine:
                 "dirty": False,
                 "tombstone": False,
                 "local_sha256": entry.get("local_sha256") if hydrated and entry else None,
+                "local_mtime_ns": (
+                    entry.get("local_mtime_ns") if hydrated and entry else None
+                ),
+                "local_ctime_ns": (
+                    entry.get("local_ctime_ns") if hydrated and entry else None
+                ),
                 "last_synced_at": entry.get("last_synced_at") if entry else None,
                 "synced_path": newpath,
             }
@@ -2529,12 +2586,14 @@ class ICloudSyncEngine:
         if not url:
             raise KeyError(f"Shared download URL missing for {node.name}")
         # The read timeout limits inactivity between bytes, not total transfer time.
-        return self.api.drive.session.get(
+        download = self.api.drive.session.get(
             url,
             params=self.api.drive.params,
             timeout=DOWNLOAD_TIMEOUT,
             **kwargs,
         )
+        self.api.drive._raise_if_error(download)
+        return download
 
     def _open_remote_file(self, node, entry, path, **kwargs):
         if entry.get("remote_shareid"):
@@ -2711,6 +2770,8 @@ class ICloudFS(Fuse):
         self.mount_gid = os.getgid()
         self.file_mode = DEFAULT_FILE_MODE
         self.dir_mode = DEFAULT_DIR_MODE
+        self.sync_paths = None
+        self.exclude_paths = []
 
     def _is_directory_type(self, node_type):
         return (node_type or "").lower() in DIRECTORY_NODE_TYPES
@@ -2793,7 +2854,7 @@ class ICloudFS(Fuse):
     ):
         try:
             marker_path = os.path.join(
-                self.cache_dir, "unrecorded_failures.log"
+                self.cache_dir, UNRECORDED_FAILURES_FILENAME
             )
             record = {
                 "timestamp": int(time.time()),
@@ -2802,10 +2863,11 @@ class ICloudFS(Fuse):
                 "error": str(exc),
                 "record_error": str(record_exc),
             }
-            with open(marker_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            with exclusive_failure_marker_lock(self.cache_dir):
+                with open(marker_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
         except Exception as marker_exc:
             # Both the database and the fallback log are unwritable, so no
             # durable record of this failure can exist and the queue is no
@@ -2846,12 +2908,15 @@ class ICloudFS(Fuse):
 
     def _path_visible(self, path):
         """Return whether a path is safe to expose before sync initialization."""
-        if self.sync_engine is None:
-            return True
+        sync_paths = self.__dict__.get("sync_paths")
+        exclude_paths = self.__dict__.get("exclude_paths", [])
+        if self.sync_engine is not None:
+            sync_paths = self.sync_engine.sync_paths
+            exclude_paths = self.sync_engine.exclude_paths
         return path_visible(
             path,
-            self.sync_engine.sync_paths,
-            self.sync_engine.exclude_paths,
+            sync_paths,
+            exclude_paths,
         )
 
     def shutdown(self):
@@ -2962,6 +3027,8 @@ class ICloudFS(Fuse):
         exclude_paths=None,
         auto_sync=True,
     ):
+        self.sync_paths = normalize_icloud_paths(sync_paths) or None
+        self.exclude_paths = normalize_icloud_paths(exclude_paths)
         self.mirror = LocalMirror(cache_dir, file_mode=self.file_mode, dir_mode=self.dir_mode)
         state_path = os.path.join(cache_dir, "state.sqlite3")
         self.state = SyncState(state_path)
