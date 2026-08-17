@@ -194,12 +194,14 @@ cmd_start() { cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service
 cmd_stop() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user --no-pager status icloud.service || true; }
 cmd_restart() { systemctl --user stop icloud.service >/dev/null 2>&1 || true; cleanup_mountpoint "${1:-}"; systemctl --user start icloud.service; systemctl --user --no-pager status icloud.service; }
 cmd_status() {
-  systemctl --user --no-pager status icloud.service || true
+  local service_status=0
+  systemctl --user --no-pager status icloud.service || service_status=$?
   if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
-    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_diagnostic.py" --config "$CONFIG_FILE" --summary
+    "$REPO_DIR/.venv/bin/python" "$REPO_DIR/queue_diagnostic.py" --config "$CONFIG_FILE" --summary || true
   else
     echo "Queue: unavailable (virtualenv not initialized)"
   fi
+  return "$service_status"
 }
 cmd_logs() { journalctl --user -u icloud.service -f; }
 cmd_hydrate() {

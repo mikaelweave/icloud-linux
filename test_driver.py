@@ -23,6 +23,7 @@ from driver import (
     LocalMirror,
     CONTROL_PLANE_TIMEOUT,
     DOWNLOAD_TIMEOUT,
+    HydrationTruncated,
     MAX_SYNC_ATTEMPTS,
     MissingMirrorFile,
     NamedFileStream,
@@ -355,6 +356,7 @@ class DriverStateTests(unittest.TestCase):
         path = "/unchanged.txt"
         self.mirror.write(path, b"unchanged", 0)
         stats = self.mirror.stat_local(path)
+        checksum = self.mirror.file_sha256(path)
         self.state.upsert_entry(
             {
                 "path": path,
@@ -366,16 +368,24 @@ class DriverStateTests(unittest.TestCase):
                 "hydrated": True,
                 "dirty": False,
                 "tombstone": False,
-                "local_sha256": self.mirror.file_sha256(path),
+                "local_sha256": checksum,
+                "local_mtime_ns": stats.st_mtime_ns,
+                "local_ctime_ns": stats.st_ctime_ns,
                 "synced_path": path,
             }
         )
         logger = Mock()
         engine = ICloudSyncEngine(Mock(), self.mirror, self.state, logger)
 
-        engine._reconcile_persistent_cache()
+        with patch.object(
+            self.mirror,
+            "file_sha256",
+            wraps=self.mirror.file_sha256,
+        ) as file_sha256:
+            engine._reconcile_persistent_cache()
 
         self.assertEqual(self.state.get_entry(path)["dirty"], 0)
+        file_sha256.assert_not_called()
         logger.info.assert_called_once_with(
             "Persistent cache ready: %s entries, %s directories recreated, "
             "%s files queued for hydration, %s files queued for upload",
@@ -384,6 +394,40 @@ class DriverStateTests(unittest.TestCase):
             0,
             0,
         )
+
+    def test_reconcile_detects_same_size_edit_with_restored_mtime(self):
+        path = "/same-size.txt"
+        self.mirror.write(path, b"before", 0)
+        before = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": "file-1",
+                "size": before.st_size,
+                "mtime": int(before.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "local_sha256": self.mirror.file_sha256(path),
+                "local_mtime_ns": before.st_mtime_ns,
+                "local_ctime_ns": before.st_ctime_ns,
+                "synced_path": path,
+            }
+        )
+        self.mirror.write(path, b"after!", 0)
+        os.utime(
+            self.mirror.local_path(path),
+            ns=(before.st_atime_ns, before.st_mtime_ns),
+        )
+        engine = ICloudSyncEngine(Mock(), self.mirror, self.state, Mock())
+        try:
+            engine._reconcile_persistent_cache()
+        finally:
+            engine.shutdown()
+
+        self.assertEqual(self.state.get_entry(path)["dirty"], 1)
 
     def test_reconcile_persistent_cache_does_not_queue_file_without_stored_checksum(self):
         path = "/unknown-checksum.txt"
@@ -1171,6 +1215,38 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.assertEqual(type(caught.exception).__name__, "HydrationTruncated")
         self.assertEqual(self.state.get_entry(path)["hydrated"], 0)
         self.assertFalse(self.mirror.exists(path))
+
+    def test_ensure_local_file_uses_metadata_size_for_encoded_download(self):
+        path = "/docs/truncated.json"
+        self._add_unhydrated_remote_file(path, 10)
+        response = self._response(
+            b"short",
+            {"Content-Encoding": "gzip", "Content-Length": "5"},
+        )
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        with self.assertRaises(HydrationTruncated):
+            self.engine.ensure_local_file(path)
+
+        self.assertFalse(self.mirror.exists(path))
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 0)
+
+    def test_ensure_local_file_rejects_http_error_response(self):
+        path = "/docs/error.json"
+        self._add_unhydrated_remote_file(path, 10)
+        response = self._response(b'{"error":1}', {"Content-Length": "11"})
+        response.status_code = 503
+        node = Mock()
+        node.open.return_value = response
+        self.engine._node_from_entry = Mock(return_value=node)
+
+        with self.assertRaises(Exception):
+            self.engine.ensure_local_file(path)
+
+        self.assertFalse(self.mirror.exists(path))
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 0)
 
     def test_ensure_local_file_allows_decoded_gzip_size_to_differ_from_header(self):
         path = "/docs/compressed.json"
@@ -2263,6 +2339,24 @@ class ICloudFSVisibilityTests(unittest.TestCase):
 
         self.assertIn("Documents", [entry.name for entry in self.fs.readdir("/", 0)])
         self.assertNotEqual(self.fs.getattr("/Documents"), -errno.ENOENT)
+
+    def test_auth_failure_keeps_configured_path_policy(self):
+        self.engine.shutdown()
+        self.fs.sync_engine = None
+        self.fs.sync_paths = ["/Obsidian/Work Notes"]
+        self.fs.exclude_paths = ["/Obsidian/Work Notes/private"]
+        self._populate_scope_tree()
+        self._add_entry("/Obsidian/Work Notes/private", "folder")
+
+        self.assertEqual(self.fs.getattr("/Documents"), -errno.ENOENT)
+        self.assertEqual(
+            self.fs.getattr("/Obsidian/Work Notes/private"),
+            -errno.ENOENT,
+        )
+        self.assertNotEqual(
+            self.fs.getattr("/Obsidian/Work Notes/note.md"),
+            -errno.ENOENT,
+        )
 
 
 class DurableHydrationQueueTests(unittest.TestCase):

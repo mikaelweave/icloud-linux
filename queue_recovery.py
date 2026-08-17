@@ -10,9 +10,12 @@ import sys
 
 import yaml
 
+from failure_markers import (
+    UNRECORDED_FAILURES_FILENAME,
+    exclusive_failure_marker_lock,
+)
 
 WRITE_TIMEOUT_SECONDS = 30
-UNRECORDED_FAILURES_FILENAME = "unrecorded_failures.log"
 
 
 def normalize_path(path):
@@ -55,44 +58,39 @@ def clear_unrecorded_failure_markers(cache_dir, path):
     """
     marker_path = os.path.join(cache_dir, UNRECORDED_FAILURES_FILENAME)
     try:
-        with open(marker_path, encoding="utf-8", errors="replace") as handle:
-            lines = handle.readlines()
-    except FileNotFoundError:
-        return 0
-    except OSError as exc:
-        print(
-            f"WARNING: queue state was reset but fallback markers remain: {exc}",
-            file=sys.stderr,
-        )
-        return 0
+        with exclusive_failure_marker_lock(cache_dir):
+            try:
+                with open(marker_path, encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except FileNotFoundError:
+                return 0
 
-    remaining_lines = []
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (TypeError, ValueError):
-            record = None
-        if not isinstance(record, dict) or record.get("path") is None:
-            # A damaged record cannot be attributed to a path, so only a
-            # global retry - an explicit request to reset everything - may
-            # discard it. Otherwise it would be reported forever.
-            if path is not None:
-                remaining_lines.append(line)
-            continue
-        if not path_in_subtree(record.get("path"), path):
-            remaining_lines.append(line)
+            remaining_lines = []
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    record = None
+                if not isinstance(record, dict) or record.get("path") is None:
+                    # Only a global retry may discard an unattributable record.
+                    if path is not None:
+                        remaining_lines.append(line)
+                    continue
+                if not path_in_subtree(record.get("path"), path):
+                    remaining_lines.append(line)
 
-    if len(remaining_lines) == len(lines):
-        return 0
-    removed = len(lines) - len(remaining_lines)
-    try:
-        if remaining_lines:
-            replacement_path = marker_path + ".retry"
-            with open(replacement_path, "w", encoding="utf-8") as handle:
-                handle.writelines(remaining_lines)
-            os.replace(replacement_path, marker_path)
-        else:
-            os.remove(marker_path)
+            if len(remaining_lines) == len(lines):
+                return 0
+            removed = len(lines) - len(remaining_lines)
+            if remaining_lines:
+                replacement_path = marker_path + ".retry"
+                with open(replacement_path, "w", encoding="utf-8") as handle:
+                    handle.writelines(remaining_lines)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(replacement_path, marker_path)
+            else:
+                os.remove(marker_path)
     except OSError as exc:
         print(
             f"WARNING: queue state was reset but fallback markers remain: {exc}",

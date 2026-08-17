@@ -5,11 +5,13 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 
 import queue_diagnostic
 import queue_recovery
+from failure_markers import exclusive_failure_marker_lock
 
 
 ENTRY_SCHEMA = """
@@ -459,6 +461,36 @@ class QueueDiagnosticTests(unittest.TestCase):
         with open(marker_path, encoding="utf-8") as handle:
             remaining = [json.loads(line)["path"] for line in handle if line.strip()]
         self.assertEqual(remaining, ["/keep.txt"])
+
+    def test_recovery_uses_cross_process_marker_lock(self):
+        conn = self.create_db()
+        conn.commit()
+        conn.close()
+        marker_path = os.path.join(
+            self.cache_dir,
+            queue_recovery.UNRECORDED_FAILURES_FILENAME,
+        )
+        with open(marker_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"path": "/remove.txt"}) + "\n")
+
+        started = threading.Event()
+        finished = threading.Event()
+
+        def recover():
+            started.set()
+            queue_recovery.clear_unrecorded_failure_markers(
+                self.cache_dir, "/remove.txt"
+            )
+            finished.set()
+
+        with exclusive_failure_marker_lock(self.cache_dir):
+            worker = threading.Thread(target=recover)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.1))
+
+        worker.join(1)
+        self.assertTrue(finished.is_set())
     def test_corrupt_marker_line_is_surfaced_not_skipped(self):
         """The fallback log is the last-resort visibility mechanism, so a
         damaged record must never be silently dropped."""
