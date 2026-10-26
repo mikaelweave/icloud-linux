@@ -1,100 +1,60 @@
 # Authentication and 2FA
 
-## How Apple HSA2 authentication works
+Run `./icloudctl auth` interactively to establish a trusted iCloud session.
+The background service reuses the saved cookies and cannot prompt for a code.
+Use your Apple account password, not an app-specific password.
 
-iCloud uses HSA2 (Hardware Security Account v2) for two-factor authentication. When
-pyicloud signs in with your Apple ID credentials, Apple detects the new login attempt
-and routes the 2FA challenge through a **WebSocket bridge**:
+## Authentication methods
 
-1. pyicloud connects to `websocket.push.apple.com` and registers a push token
-2. pyicloud posts a "step 0" payload to Apple's auth endpoint, which triggers Apple to
-   send a push notification to your trusted devices ("Are you trying to sign in?")
-3. You tap **Allow** on your iPhone or Mac
-4. Apple sends the approval back over the WebSocket
-5. A 6-digit code appears on your device — you enter it to complete sign-in
+The bootstrap detects Apple's account partition before signing in. It requests
+Apple's preferred 2FA delivery method and asks for the numeric code. Accounts
+using older two-step authentication can still select a trusted device and enter
+its verification code.
 
-The bridge step is why you must run `./icloudctl auth` interactively rather than
-letting the background service handle 2FA — the service has no terminal and cannot
-orchestrate the WebSocket handshake.
+If your device receives a push notification without a numeric code, request SMS:
+
+```bash
+./icloudctl auth --force-sms
+```
+
+If Apple requires updated terms of service, accept them explicitly:
+
+```bash
+./icloudctl auth --accept-terms
+```
+
+`./icloudctl auth --debug` prints the reported authentication mode and delivery
+options. A browser trust token can also be supplied with `--trust-token`.
+Treat that token as a credential.
 
 ## Re-authenticating
 
-Sessions expire roughly every 30 days. When the service starts failing with
-"2FA required, but no interactive terminal is available", re-authenticate:
+When the session expires, run:
 
 ```bash
-systemctl --user stop icloud.service
-./icloudctl auth          # follow the prompts; tap Allow on your Apple device
-systemctl --user start icloud.service
+./icloudctl auth
+./icloudctl restart
 ```
 
-The service is configured with `RestartPreventExitStatus=2` so it will enter a
-permanent `failed` state on auth errors rather than crash-looping. This prevents
-hammering Apple's auth endpoint and triggering rate-limits or account lockouts.
+For a system-service installation, use `./icloudctl restart-system` instead.
+`./icloudctl auth-status` reports the age of the saved session files. This is
+an estimate, not a live check that Apple still accepts the session.
 
-## pyicloud 2.5.0 bridge compatibility patch (PR #233)
+## Service behavior without a session
 
-**Background:** pyicloud 2.5.0 introduced the WebSocket bridge described above, but
-Apple subsequently changed their bridge push payload format — the `sessionUUID` field
-was replaced by `flowid`. This caused pyicloud to raise a Pydantic validation error
-and fall back to a legacy path that does not trigger the device push, so users never
-received the "Are you trying to sign in?" notification.
+When authentication fails during non-interactive startup, the driver keeps
+running without a sync engine. Already hydrated cached files remain readable.
+Writes return `EACCES`, and reads requiring a download return `EIO`.
+Authenticate interactively and restart the service to restore synchronization.
 
-**Symptoms:**
-- `./icloudctl auth` prompts for a code but no push arrives on Apple devices
-- Signing in via a browser (appleid.apple.com) works fine and does send a push
-- The background service crash-loops with "Invalid email/password combination" or
-  "2FA required, no interactive terminal" at high restart counts
+This replaces the older startup behavior that exited with code 2 on
+authentication failures. Generated units retain `RestartPreventExitStatus=2`
+for compatibility, but non-interactive authentication failures no longer use
+that exit path.
 
-**Fix:** `./icloudctl init` and `./icloudctl auth` run
-`scripts/patch_pyicloud_hsa2_bridge.py` after dependency installation. The
-helper patches the installed `pyicloud/hsa2_bridge.py` inside this project's
-virtualenv to accept `flowid` as a fallback when `sessionUUID` is absent, based
-on the approach in [timlaing/pyicloud PR #233](https://github.com/timlaing/pyicloud/pull/233).
-It is idempotent, so it is safe for setup commands to run repeatedly.
+## Dependency compatibility
 
-The patch makes `_BridgePushPayloadModel` accept both fields:
-
-```python
-session_uuid: Optional[StrictStr] = Field(default=None, alias="sessionUUID")
-flow_id: Optional[StrictStr] = Field(default=None, alias="flowid")
-```
-
-And resolves whichever is present:
-
-```python
-resolved_session_uuid = validated.session_uuid or validated.flow_id
-```
-
-The patch also updates the payload validator to allow either identifier,
-resolves whichever field Apple sends before building `BridgePushPayload`, and
-removes the bridge mismatch checks that compare Apple's generated `flowid`
-against pyicloud's locally generated `sessionUUID`.
-
-**When PR #233 merges into a pyicloud release**, update `requirements.txt` to the new
-version and remove the compatibility patch invocation from `icloudctl`. The
-setup-time patch will then be superseded by the official release.
-
-## Service reliability
-
-The systemd service is configured to stop permanently on auth failures rather than
-retrying forever. Two parts make this work:
-
-**`driver.py`** — catches auth exceptions at startup and exits with code 2:
-
-```python
-try:
-    fs.init_icloud(username, password, cache_dir, cookie_dir)
-except (PyiCloudFailedLoginException, PyiCloud2FARequiredException, ...):
-    logger.error("Service stopping due to auth failure. Run './icloudctl auth' then './icloudctl start'.")
-    sys.exit(2)
-```
-
-**`icloudctl`** — the generated service file includes:
-
-```ini
-RestartPreventExitStatus=2
-```
-
-Network errors and crashes still use exit code 1 and will be restarted automatically.
-Only auth failures (which require user interaction to resolve) stop the service.
+The project now requires `pyicloud>=2.6.4` for deferred authentication.
+Setup no longer runs the compatibility patch for pyicloud 2.5.0.
+`scripts/patch_pyicloud_hsa2_bridge.py` remains as a legacy utility and is not
+part of installation or authentication.

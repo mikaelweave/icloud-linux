@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -6,6 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -1156,6 +1158,47 @@ class SyncEngineStartupTests(unittest.TestCase):
         self.engine._schedule_download.assert_called_once_with("/docs/a.txt")
 
 
+    def test_shutdown_is_reentrant_for_signal_handler(self):
+        # A SIGTERM arriving while shutdown() is already running re-enters it on
+        # the same thread, because Python runs signal handlers on the main
+        # thread. Simulate that by re-entering from inside the thread join loop.
+        reentered = []
+
+        def rejoin(timeout=None):
+            if not reentered:
+                reentered.append(True)
+                self.engine.shutdown()
+
+        worker = Mock()
+        worker.join = rejoin
+        self.engine.threads = [worker]
+
+        finished = threading.Event()
+
+        def run_shutdown():
+            self.engine.shutdown()
+            finished.set()
+
+        thread = threading.Thread(target=run_shutdown, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+
+        self.assertTrue(
+            finished.is_set(),
+            "shutdown() deadlocked when re-entered on the same thread",
+        )
+        self.assertTrue(reentered)
+
+
+    def test_request_remote_refresh_sets_wakeup_event(self):
+        self.assertFalse(self.engine.refresh_now_event.is_set())
+
+        self.engine.request_remote_refresh()
+
+        self.assertTrue(self.engine.refresh_now_event.is_set())
+
+
+
 class ICloudAuthBootstrapTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="icloud-linux-auth-test-")
@@ -1171,6 +1214,7 @@ class ICloudAuthBootstrapTests(unittest.TestCase):
 
         with (
             patch("driver.PyiCloudService", return_value=api),
+            patch("requests.post", return_value=Mock(headers={})),
             patch("driver.sys.stdin.isatty", return_value=False),
         ):
             with self.assertRaises(RuntimeError):
@@ -1181,6 +1225,9 @@ class ICloudAuthBootstrapTests(unittest.TestCase):
             requires_2fa = True
             requires_2sa = False
             is_trusted_session = False
+
+            def authenticate(self):
+                pass
 
             def validate_2fa_code(self, code):
                 self.validated_code = code
@@ -1195,6 +1242,7 @@ class ICloudAuthBootstrapTests(unittest.TestCase):
 
         with (
             patch("driver.PyiCloudService", return_value=api),
+            patch("requests.post", return_value=Mock(headers={})),
             patch("driver.sys.stdin.isatty", return_value=True),
             patch("builtins.input", return_value="123456"),
         ):
@@ -1276,6 +1324,346 @@ class PermissionConfigTests(unittest.TestCase):
     def test_resolve_permissions_config_rejects_invalid_mode(self):
         with self.assertRaises(ValueError):
             resolve_permissions_config({"dir_mode": "not-a-mode"})
+
+    def test_presented_directory_types_are_case_insensitive(self):
+        for entry_type in ("folder", "Folder", "app_library", "APP_LIBRARY"):
+            with self.subTest(entry_type=entry_type):
+                self.assertTrue(self.fs._is_directory_type(entry_type))
+
+
+
+class OfflineCacheModeTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-offline-test-")
+        self.cache_dir = os.path.join(self.root, "cache")
+        self.mirror = LocalMirror(self.cache_dir)
+        self.state = SyncState(os.path.join(self.cache_dir, "state.sqlite3"))
+        self.fs = ICloudFS()
+        self.fs.api = None
+        self.fs.cache_dir = self.cache_dir
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = None
+
+    def tearDown(self):
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def test_hydrated_cached_file_is_readable_without_session(self):
+        self.mirror.ensure_dir("/docs")
+        self.mirror.write("/docs/a.txt", b"cached", 0)
+        self.state.upsert_entry(
+            {
+                "path": "/docs/a.txt",
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "size": 6,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/docs/a.txt",
+            }
+        )
+
+        self.assertEqual(self.fs.open("/docs/a.txt", os.O_RDONLY), 0)
+        self.assertEqual(self.fs.read("/docs/a.txt", 100, 0), b"cached")
+
+    def test_metadata_only_entries_do_not_crash_getattr_without_session(self):
+        self.state.upsert_entry(
+            {
+                "path": "/remote-only",
+                "type": "folder",
+                "parent_path": "/",
+                "remote_drivewsid": "folder-1",
+                "size": 0,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/remote-only",
+            }
+        )
+        self.state.upsert_entry(
+            {
+                "path": "/remote-only/a.txt",
+                "type": "file",
+                "parent_path": "/remote-only",
+                "remote_drivewsid": "file-1",
+                "size": 5,
+                "mtime": 123,
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": "/remote-only/a.txt",
+            }
+        )
+
+        folder_attrs = self.fs.getattr("/remote-only")
+        file_attrs = self.fs.getattr("/remote-only/a.txt")
+
+        self.assertTrue(stat.S_ISDIR(folder_attrs.st_mode))
+        self.assertTrue(stat.S_ISREG(file_attrs.st_mode))
+        self.assertEqual(file_attrs.st_size, 5)
+
+    def test_writes_are_denied_without_session(self):
+        self.assertEqual(self.fs.create("/offline.txt", 0o644), -errno.EACCES)
+
+
+
+class RemoteSnapshotRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        api = Mock()
+        api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(api, self.mirror, self.state, Mock())
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def _add_clean_remote_file(self, path, last_synced_at):
+        self.mirror.write(path, b"content", 0)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": f"remote-{path}",
+                "size": 7,
+                "mtime": 123,
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "last_synced_at": last_synced_at,
+                "synced_path": path,
+            }
+        )
+
+    def test_snapshot_does_not_remove_file_synced_after_crawl_started(self):
+        self._add_clean_remote_file("/new.txt", last_synced_at=200)
+
+        self.engine._apply_remote_snapshot({}, crawl_started_at=200)
+
+        self.assertIsNotNone(self.state.get_entry("/new.txt"))
+        self.assertTrue(self.mirror.exists("/new.txt"))
+
+    def test_snapshot_still_removes_file_synced_before_crawl_started(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=199)
+
+        self.engine._apply_remote_snapshot({}, crawl_started_at=200)
+
+        self.assertIsNone(self.state.get_entry("/old.txt"))
+        self.assertFalse(self.mirror.exists("/old.txt"))
+
+
+
+class PermissionCallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.mirror.write("/copied.txt", b"content", 0)
+        stats = self.mirror.stat_local("/copied.txt")
+        self.state.upsert_entry(
+            {
+                "path": "/copied.txt",
+                "type": "file",
+                "parent_path": "/",
+                "remote_drivewsid": None,
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": None,
+            }
+        )
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+
+    def tearDown(self):
+        self.state.conn.close()
+        shutil.rmtree(self.root)
+
+    def test_permission_callbacks_are_safe_noops_for_existing_entries(self):
+        pending_before = self.state.conn.execute(
+            "SELECT COUNT(*) FROM pending_ops"
+        ).fetchone()[0]
+
+        self.assertEqual(self.fs.chmod("/copied.txt", 0o600), 0)
+        self.assertEqual(self.fs.chown("/copied.txt", os.getuid(), os.getgid()), 0)
+
+        entry = self.state.get_entry("/copied.txt")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["dirty"] if entry else None, 0)
+        pending_after = self.state.conn.execute(
+            "SELECT COUNT(*) FROM pending_ops"
+        ).fetchone()[0]
+        self.assertEqual(pending_after, pending_before)
+
+    def test_permission_callbacks_reject_missing_paths(self):
+        self.assertEqual(self.fs.chmod("/missing.txt", 0o600), -errno.ENOENT)
+        self.assertEqual(
+            self.fs.chown("/missing.txt", os.getuid(), os.getgid()),
+            -errno.ENOENT,
+        )
+
+
+
+class ICloudFSPathPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="icloud-linux-test-")
+        self.mirror = LocalMirror(self.root)
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.api = Mock()
+        self.api.drive.root = Mock()
+        self.engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            sync_paths=["/allowed/"],
+            exclude_paths=["/allowed/excluded/"],
+        )
+        self.fs = ICloudFS.__new__(ICloudFS)
+        self.fs.logger = Mock()
+        self.fs.api = self.api
+        self.fs.mirror = self.mirror
+        self.fs.state = self.state
+        self.fs.sync_engine = self.engine
+
+    def tearDown(self):
+        self.engine.shutdown()
+        self.state.close()
+        shutil.rmtree(self.root)
+
+    def _add_entry(self, path, entry_type="file", content=b"existing"):
+        if entry_type == "folder":
+            self.mirror.ensure_dir(path)
+        else:
+            self.mirror.write(path, content, 0)
+        stats = self.mirror.stat_local(path)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": entry_type,
+                "parent_path": os.path.dirname(path) or "/",
+                "remote_drivewsid": f"remote-{path}",
+                "size": stats.st_size,
+                "mtime": int(stats.st_mtime),
+                "hydrated": True,
+                "dirty": False,
+                "tombstone": False,
+                "synced_path": path,
+            }
+        )
+
+    def _pending_op_count(self):
+        return self.state.conn.execute("SELECT COUNT(*) FROM pending_ops").fetchone()[0]
+
+    def test_allowed_mutations_are_accepted(self):
+        self.assertEqual(self.fs.create("/allowed/queued.txt", 0o644), 0)
+        self.assertEqual(self.fs.mkdir("/allowed/newdir", 0o755), 0)
+        self.assertEqual(self.fs.create("/allowed/newdir/file.txt", 0o644), 0)
+        self.assertEqual(self.fs.write("/allowed/newdir/file.txt", b"hello", 0), 5)
+        self.assertEqual(self.fs.truncate("/allowed/newdir/file.txt", 2), 0)
+        self.assertEqual(
+            self.fs.rename("/allowed/newdir/file.txt", "/allowed/newdir/renamed.txt"),
+            0,
+        )
+        self.assertEqual(self.fs.unlink("/allowed/newdir/renamed.txt"), 0)
+        self.assertEqual(self.fs.rmdir("/allowed/newdir"), 0)
+        self.assertGreater(self._pending_op_count(), 0)
+
+    def test_excluded_and_out_of_scope_mutations_are_rejected_without_queueing(self):
+        self._add_entry("/allowed/source.txt")
+        self._add_entry("/allowed/excluded/file.txt")
+        self._add_entry("/outside/file.txt")
+        self._add_entry("/outside/dir", entry_type="folder")
+
+        entry_paths_before = [entry["path"] for entry in self.state.list_entries()]
+
+        attempts = [
+            self.fs.create("/allowed/excluded/new.txt", 0o644),
+            self.fs.write("/outside/file.txt", b"changed", 0),
+            self.fs.truncate("/allowed/excluded/file.txt", 0),
+            self.fs.mkdir("/outside/newdir", 0o755),
+            self.fs.unlink("/allowed/excluded/file.txt"),
+            self.fs.rmdir("/outside/dir"),
+            self.fs.rename("/allowed/source.txt", "/outside/destination.txt"),
+            self.fs.rename("/outside/file.txt", "/allowed/destination.txt"),
+            self.fs.open("/outside/file.txt", os.O_WRONLY),
+            self.fs.mknod("/outside/node.txt", stat.S_IFREG | 0o644, 0),
+            self.fs.utime("/outside/file.txt", None),
+        ]
+
+        self.assertEqual(attempts, [-errno.EACCES] * len(attempts))
+        self.assertEqual(self._pending_op_count(), 0)
+        self.assertEqual(
+            [entry["path"] for entry in self.state.list_entries()],
+            entry_paths_before,
+        )
+        self.assertEqual(self.mirror.read("/outside/file.txt", 100, 0), b"existing")
+        self.assertTrue(self.mirror.exists("/allowed/source.txt"))
+        self.assertFalse(self.mirror.exists("/outside/destination.txt"))
+
+    def test_uploader_skips_disallowed_dirty_entries(self):
+        self._add_entry("/allowed/file.txt")
+        self._add_entry("/allowed/excluded/file.txt")
+        self._add_entry("/outside/file.txt")
+        self._add_entry("/allowed/moved.txt")
+        self.state.mark_dirty("/allowed/file.txt")
+        self.state.mark_dirty("/allowed/excluded/file.txt")
+        self.state.mark_dirty("/outside/file.txt")
+        self.state.upsert_entry(
+            {
+                **self.state.get_entry("/allowed/moved.txt"),
+                "dirty": True,
+                "synced_path": "/outside/original.txt",
+            }
+        )
+        self.engine._sync_file = Mock()
+
+        self.engine.sync_dirty_entries()
+
+        self.engine._sync_file.assert_called_once_with(
+            self.state.get_entry("/allowed/file.txt")
+        )
+
+    def test_rename_rejects_allowed_directory_with_excluded_descendant(self):
+        self.engine.exclude_paths = ["/allowed/parent/excluded"]
+        self._add_entry("/allowed/parent", entry_type="folder")
+        self._add_entry("/allowed/parent/excluded", entry_type="folder")
+        self._add_entry("/allowed/parent/excluded/file.txt")
+
+        result = self.fs.rename("/allowed/parent", "/allowed/newparent")
+
+        self.assertEqual(result, -errno.EACCES)
+        self.assertTrue(self.mirror.exists("/allowed/parent/excluded/file.txt"))
+        self.assertFalse(self.mirror.exists("/allowed/newparent"))
+        self.assertIsNotNone(self.state.get_entry("/allowed/parent/excluded/file.txt"))
+        self.assertIsNone(self.state.get_entry("/allowed/newparent"))
+
+    def test_empty_sync_paths_preserve_unrestricted_behavior(self):
+        engine = ICloudSyncEngine(
+            self.api,
+            self.mirror,
+            self.state,
+            Mock(),
+            sync_paths=[],
+        )
+        try:
+            self.assertTrue(engine._path_allowed("/outside/file.txt"))
+        finally:
+            engine.shutdown()
+
 
 
 if __name__ == "__main__":

@@ -24,13 +24,15 @@ class AuthBootstrapTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
-    def run_auth(self, api, inputs=()):
+    def run_auth(self, api, inputs=(), flags=()):
+        api.data = {}
         input_iter = iter(inputs)
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             patch.object(auth, "PyiCloudService", return_value=api),
-            patch("sys.argv", ["auth.py", self.config_path]),
+            patch.object(auth, "get_partition", return_value=None),
+            patch("sys.argv", ["auth.py", self.config_path, *flags]),
             patch("builtins.input", side_effect=lambda prompt="": next(input_iter)),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
@@ -91,6 +93,44 @@ class AuthBootstrapTests(unittest.TestCase):
         api.validate_verification_code.assert_called_once_with(api.trusted_devices[0], "654321")
         self.assertIn("AUTH_OK", stdout)
         self.assertNotIn("DEBUG", stderr)
+
+    def test_accept_terms_uses_deferred_authentication(self):
+        api = Mock(requires_2fa=False, requires_2sa=False)
+
+        api.data = {}
+        with (
+            patch.object(auth, "PyiCloudService", return_value=api) as service,
+            patch.object(auth, "get_partition", return_value=None),
+            patch("sys.argv", ["auth.py", self.config_path, "--accept-terms"]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            auth.main()
+
+        service.assert_called_once_with(
+            "user@example.com",
+            "secret",
+            cookie_directory=self.cookie_dir,
+            accept_terms=True,
+            authenticate=False,
+        )
+        api.authenticate.assert_called_once_with(force_refresh=True)
+
+    def test_forced_sms_does_not_request_push(self):
+        api = Mock(requires_2fa=True, requires_2sa=False, is_trusted_session=False)
+        api._request_sms_2fa_code.return_value = True
+
+        def validate_sms(code):
+            api.requires_2fa = False
+
+        api._validate_sms_code.side_effect = validate_sms
+
+        stdout, _ = self.run_auth(api, inputs=["123456"], flags=["--force-sms"])
+
+        api._request_sms_2fa_code.assert_called_once_with()
+        api._validate_sms_code.assert_called_once_with("123456")
+        api.request_2fa_code.assert_not_called()
+        api.trust_session.assert_called_once_with()
+        self.assertIn("AUTH_OK", stdout)
 
 
 if __name__ == "__main__":

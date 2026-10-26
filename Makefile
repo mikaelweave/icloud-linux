@@ -1,4 +1,4 @@
-.PHONY: help quickstart init configure auth auth-status start stop restart status logs doctor uninstall
+.PHONY: help quickstart init configure auth auth-status start stop restart refresh status logs doctor uninstall
 
 help:
 	@echo "Targets:"
@@ -7,7 +7,7 @@ help:
 	@echo "  make configure    # write credentials config"
 	@echo "  make auth         # run interactive 2FA bootstrap"
 	@echo "  make auth-status  # show saved session age"
-	@echo "  make start|stop|restart|status|logs|doctor|uninstall"
+	@echo "  make start|stop|restart|refresh|status|logs|doctor|uninstall"
 
 quickstart:
 	./icloudctl quickstart
@@ -32,6 +32,9 @@ stop:
 
 restart:
 	./icloudctl restart
+
+refresh:
+	./icloudctl refresh
 
 status:
 	./icloudctl status
