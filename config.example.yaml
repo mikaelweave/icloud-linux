@@ -62,12 +62,12 @@ auto_sync: true
 
 # Presented ownership and permissions for the mounted files. This is important
 # for containerized access (e.g. an Incus/OpenClaw container reading the mount):
-# files are presented with these modes and owned by the given uid/gid, and the
-# on-disk cache mirror is chmod'd to match so a container reading the mirror dir
-# directly sees consistent permissions.
+# cloud files use these defaults; new files use the creator and requested mode.
+# Explicit mounted modes persist locally, not in iCloud. The backing cache keeps
+# these modes for daemon access; share only the FUSE mount with containers.
 permissions:
-  file_mode: "0644"   # Mode presented for files (octal string)
-  dir_mode: "0755"    # Mode presented for directories (octal string)
+  file_mode: "0644"   # Default file and backing-cache mode (octal string)
+  dir_mode: "0755"    # Default directory and backing-cache mode (octal string)
   # uid: 1000         # Defaults to the process uid if unset
   # gid: 1000         # Defaults to the process gid if unset
 

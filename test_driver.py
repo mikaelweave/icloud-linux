@@ -924,6 +924,8 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         self.fs.mirror = self.mirror
         self.fs.state = self.state
         self.fs.sync_engine = self.engine
+        self.fs.apply_permissions_config(None)
+        self.fs.GetContext = Mock(return_value={"uid": os.getuid(), "gid": os.getgid()})
 
     def tearDown(self):
         self.engine.shutdown()

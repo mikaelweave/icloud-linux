@@ -223,7 +223,10 @@ class SyncState:
                     tombstone INTEGER NOT NULL DEFAULT 0,
                     local_sha256 TEXT,
                     last_synced_at INTEGER,
-                    synced_path TEXT
+                    synced_path TEXT,
+                    local_mode INTEGER,
+                    local_uid INTEGER,
+                    local_gid INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_entries_remote_drivewsid
                     ON entries(remote_drivewsid);
@@ -252,6 +255,9 @@ class SyncState:
                 self.conn.execute(
                     "ALTER TABLE entries ADD COLUMN remote_unified_token TEXT"
                 )
+            for column in ("local_mode", "local_uid", "local_gid"):
+                if column not in columns:
+                    self.conn.execute(f"ALTER TABLE entries ADD COLUMN {column} INTEGER")
             self.conn.commit()
 
     def close(self):
@@ -281,6 +287,9 @@ class SyncState:
             "local_sha256": entry.get("local_sha256"),
             "last_synced_at": entry.get("last_synced_at"),
             "synced_path": entry.get("synced_path", entry["path"]),
+            "local_mode": entry.get("local_mode"),
+            "local_uid": entry.get("local_uid"),
+            "local_gid": entry.get("local_gid"),
         }
         with self.lock:
             self.conn.execute(
@@ -289,12 +298,12 @@ class SyncState:
                     path, type, parent_path, remote_drivewsid, remote_docwsid, remote_etag,
                     remote_zone, remote_shareid, remote_itemid, remote_unified_token,
                     size, mtime, hydrated, dirty, tombstone, local_sha256,
-                    last_synced_at, synced_path
+                    last_synced_at, synced_path, local_mode, local_uid, local_gid
                 ) VALUES (
                     :path, :type, :parent_path, :remote_drivewsid, :remote_docwsid, :remote_etag,
                     :remote_zone, :remote_shareid, :remote_itemid, :remote_unified_token,
                     :size, :mtime, :hydrated, :dirty, :tombstone, :local_sha256,
-                    :last_synced_at, :synced_path
+                    :last_synced_at, :synced_path, :local_mode, :local_uid, :local_gid
                 )
                 ON CONFLICT(path) DO UPDATE SET
                     type = excluded.type,
@@ -313,7 +322,10 @@ class SyncState:
                     tombstone = excluded.tombstone,
                     local_sha256 = excluded.local_sha256,
                     last_synced_at = excluded.last_synced_at,
-                    synced_path = excluded.synced_path
+                    synced_path = excluded.synced_path,
+                    local_mode = COALESCE(excluded.local_mode, entries.local_mode),
+                    local_uid = COALESCE(excluded.local_uid, entries.local_uid),
+                    local_gid = COALESCE(excluded.local_gid, entries.local_gid)
                 """,
                 payload,
             )
@@ -2053,6 +2065,7 @@ class ICloudSyncEngine:
 class ICloudFS(Fuse):
     def __init__(self, *args, **kw):
         super(ICloudFS, self).__init__(*args, **kw)
+        self.fuse_args.add("default_permissions")
         self.logger = logging.getLogger("icloud")
         self.username = None
         self.password = None
@@ -2096,11 +2109,29 @@ class ICloudFS(Fuse):
     def _permission_mode_for_entry(self, entry_type):
         return self.dir_mode if self._is_directory_type(entry_type) else self.file_mode
 
-    def _apply_presented_permissions(self, attrs, entry_type):
+    def _apply_presented_permissions(self, attrs, entry_type, entry=None):
+        entry = entry or {}
         file_type = stat.S_IFDIR if self._is_directory_type(entry_type) else stat.S_IFREG
-        attrs.st_mode = file_type | self._permission_mode_for_entry(entry_type)
-        attrs.st_uid = self.mount_uid
-        attrs.st_gid = self.mount_gid
+        mode = entry.get("local_mode")
+        uid = entry.get("local_uid")
+        gid = entry.get("local_gid")
+        attrs.st_mode = file_type | (self._permission_mode_for_entry(entry_type) if mode is None else mode)
+        attrs.st_uid = self.mount_uid if uid is None else uid
+        attrs.st_gid = self.mount_gid if gid is None else gid
+
+    def _creation_permissions(self, path, mode, is_dir=False):
+        context = self.GetContext()
+        parent = self.getattr(os.path.dirname(path) or "/")
+        gid = context["gid"]
+        if not isinstance(parent, int) and parent.st_mode & stat.S_ISGID:
+            gid = parent.st_gid
+            if is_dir:
+                mode |= stat.S_ISGID
+        return {
+            "local_mode": stat.S_IMODE(mode),
+            "local_uid": context["uid"],
+            "local_gid": gid,
+        }
 
     def _log_file_op(self, op, path=None, level=logging.INFO, **fields):
         payload = {}
@@ -2273,9 +2304,9 @@ class ICloudFS(Fuse):
         if path == "/":
             try:
                 stats = self.mirror.stat_local(path)
-                self._apply_os_stat(attrs, stats)
+                self._apply_os_stat(attrs, stats, entry)
             except Exception:
-                self._apply_presented_permissions(attrs, "folder")
+                self._apply_presented_permissions(attrs, "folder", entry)
                 attrs.st_nlink = 2
                 attrs.st_size = 0
                 attrs.st_ctime = now
@@ -2285,7 +2316,7 @@ class ICloudFS(Fuse):
 
         if self.mirror and self.mirror.exists(path):
             stats = self.mirror.stat_local(path)
-            self._apply_os_stat(attrs, stats)
+            self._apply_os_stat(attrs, stats, entry)
             if entry and entry["type"] == "file" and not entry["hydrated"]:
                 attrs.st_size = entry["size"]
                 attrs.st_mtime = entry["mtime"]
@@ -2293,7 +2324,7 @@ class ICloudFS(Fuse):
             return attrs
 
         if entry and not entry["tombstone"]:
-            self._apply_presented_permissions(attrs, entry["type"])
+            self._apply_presented_permissions(attrs, entry["type"], entry)
             attrs.st_nlink = 2 if self._is_directory_type(entry["type"]) else 1
             attrs.st_size = entry["size"]
             attrs.st_ctime = entry["mtime"] or now
@@ -2346,6 +2377,7 @@ class ICloudFS(Fuse):
         if not self._mutation_allowed("create", path):
             return -errno.EACCES
         try:
+            permissions = self._creation_permissions(path, mode)
             self.mirror.create_file(path)
             stats = self.mirror.stat_local(path)
             self.state.upsert_entry(
@@ -2359,6 +2391,7 @@ class ICloudFS(Fuse):
                     "dirty": True,
                     "tombstone": False,
                     "synced_path": None,
+                    **permissions,
                 }
             )
             self.state.queue_op("create", path)
@@ -2437,6 +2470,38 @@ class ICloudFS(Fuse):
     def release(self, path, flags):
         return 0
 
+    def fsync(self, path, isfsyncfile):
+        if not self._is_authenticated() or not self._mutation_allowed("fsync", path):
+            return -errno.EACCES
+        try:
+            with open(self.mirror.local_path(path), "rb") as handle:
+                os.fsync(handle.fileno())
+            return 0
+        except OSError as exc:
+            return -(exc.errno or errno.EIO)
+
+    @state_locked
+    def chmod(self, path, mode):
+        if not self._is_authenticated() or not self._mutation_allowed("chmod", path):
+            return -errno.EACCES
+        attrs = self.getattr(path)
+        if isinstance(attrs, int):
+            return attrs
+        if self.GetContext()["uid"] not in (0, attrs.st_uid):
+            return -errno.EPERM
+        entry = self.state.get_entry(path)
+        if entry is None:
+            if path != "/":
+                return -errno.ENOENT
+            entry = {
+                "path": "/", "parent_path": "/", "type": "folder",
+                "hydrated": True, "mtime": attrs.st_mtime,
+            }
+        # POSIX metadata belongs to this mount, not the cloud or normalized cache.
+        self.state.upsert_entry({**entry, "local_mode": stat.S_IMODE(mode)})
+        self._log_file_op("chmod", path, mode=oct(mode))
+        return 0
+
     @state_locked
     def mkdir(self, path, mode):
         if not self._is_authenticated():
@@ -2444,6 +2509,7 @@ class ICloudFS(Fuse):
         if not self._mutation_allowed("mkdir", path):
             return -errno.EACCES
         try:
+            permissions = self._creation_permissions(path, mode, is_dir=True)
             self.mirror.ensure_dir(path)
             stats = self.mirror.stat_local(path)
             self.state.upsert_entry(
@@ -2457,6 +2523,7 @@ class ICloudFS(Fuse):
                     "dirty": True,
                     "tombstone": False,
                     "synced_path": None,
+                    **permissions,
                 }
             )
             self.state.queue_op("mkdir", path)
@@ -2641,7 +2708,7 @@ class ICloudFS(Fuse):
             "f_namelen": stats.f_namemax,
         }
 
-    def _apply_os_stat(self, attrs, stats):
+    def _apply_os_stat(self, attrs, stats, entry=None):
         attrs.st_mode = stats.st_mode
         attrs.st_ino = stats.st_ino
         attrs.st_dev = stats.st_dev
@@ -2650,7 +2717,9 @@ class ICloudFS(Fuse):
         attrs.st_atime = int(stats.st_atime)
         attrs.st_mtime = int(stats.st_mtime)
         attrs.st_ctime = int(stats.st_ctime)
-        self._apply_presented_permissions(attrs, "folder" if stat.S_ISDIR(stats.st_mode) else "file")
+        self._apply_presented_permissions(
+            attrs, "folder" if stat.S_ISDIR(stats.st_mode) else "file", entry
+        )
 
 
 def parse_config(config_path):

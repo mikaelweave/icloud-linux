@@ -6,6 +6,7 @@ ownership/permissions used for containerized (Incus/OpenClaw) access.
 """
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -143,6 +144,9 @@ class SharedFolderMirrorStateTests(unittest.TestCase):
         column_names = {column["name"] for column in columns}
         self.assertIn("remote_shareid", column_names)
         self.assertIn("remote_itemid", column_names)
+        self.assertIn("local_mode", column_names)
+        self.assertIn("local_uid", column_names)
+        self.assertIn("local_gid", column_names)
         self.assertIn("remote_unified_token", column_names)
         migrated.close()
 
@@ -739,6 +743,7 @@ class FuseOptionTests(unittest.TestCase):
         self.assertIn("allow_other", fs.fuse_args.optlist)
         self.assertIn("nonempty", fs.fuse_args.optlist)
         self.assertNotIn("ro", fs.fuse_args.optlist)
+        self.assertIn("default_permissions", fs.fuse_args.optlist)
         self.assertEqual(fs.fuse_args.optdict["fsname"], "icloud-linux")
 
     def test_apply_fuse_options_rejects_non_mapping(self):
@@ -756,10 +761,122 @@ class PermissionConfigTests(unittest.TestCase):
         self.fs = ICloudFS(version="%prog " + fuse.__version__, usage="%prog [options] mountpoint", dash_s_do="setsingle")
         self.fs.mirror = self.mirror
         self.fs.state = self.state
+        self.fs.api = Mock()
+        self.engine = ICloudSyncEngine(self.fs.api, self.mirror, self.state, Mock())
+        self.fs.sync_engine = self.engine
+        self.fs.GetContext = Mock(return_value={"uid": 1066536, "gid": 1066536})
 
     def tearDown(self):
+        self.engine.shutdown()
         self.state.close()
         shutil.rmtree(self.root)
+
+    def _pending_ops(self):
+        return [tuple(row) for row in self.state.conn.execute("SELECT * FROM pending_ops ORDER BY id")]
+
+    def test_create_and_mkdir_honor_requested_modes_and_creator(self):
+        self.fs.apply_permissions_config({"file_mode": "0666", "dir_mode": "0777"})
+        for mode in (0o600, 0o640, 0):
+            with self.subTest(mode=oct(mode)), temporary_umask(0o077):
+                path = f"/note-{mode}.md"
+                self.assertEqual(self.fs.create(path, mode), 0)
+                attrs = self.fs.getattr(path)
+                self.assertEqual(stat.S_IMODE(attrs.st_mode), mode)
+                self.assertEqual(attrs.st_uid, 1066536)
+                self.assertEqual(attrs.st_gid, 1066536)
+                self.assertEqual(self.state.get_entry(path)["dirty"], 1)
+        self.assertEqual(self.fs.mkdir("/private", 0o700), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/private").st_mode), 0o700)
+
+    def test_safe_write_modes_survive_mutations_and_atomic_replacement(self):
+        self.fs.apply_permissions_config({"file_mode": "0666", "dir_mode": "0777"})
+        self.assertEqual(self.fs.create("/final.md", 0o644), 0)
+        self.assertEqual(self.fs.create("/staging.tmp", 0o600), 0)
+        self.assertEqual(self.fs.chmod("/staging.tmp", 0o600), 0)
+        self.assertEqual(self.fs.write("/staging.tmp", b"note\n", 0), 5)
+        self.assertEqual(self.fs.truncate("/staging.tmp", 4), 0)
+        self.assertEqual(self.fs.fsync("/staging.tmp", 0), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/staging.tmp").st_mode), 0o600)
+        self.assertEqual(self.fs.rename("/staging.tmp", "/final.md"), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/final.md").st_mode), 0o600)
+        before = self.state.get_entry("/final.md")
+        pending = self._pending_ops()
+        self.assertEqual(self.fs.chmod("/final.md", 0o640), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/final.md").st_mode), 0o640)
+        self.assertEqual(self.fs.getattr("/final.md").st_uid, 1066536)
+        self.assertEqual(self.fs.read("/final.md", 20, 0), b"note")
+        self.assertEqual(self.state.get_entry("/final.md"), {**before, "local_mode": 0o640})
+        self.assertEqual(self._pending_ops(), pending)
+
+    def test_chmod_preserves_clean_state_and_survives_download_refresh_and_remount(self):
+        self.mirror.materialize_placeholder("/remote.md", 5, 123)
+        meta = {
+            "path": "/remote.md", "parent_path": "/", "type": "file",
+            "remote_drivewsid": "file-1", "remote_etag": "etag-1",
+            "size": 5, "mtime": 123,
+        }
+        self.state.upsert_entry(meta)
+        self.fs.GetContext.return_value = {"uid": os.getuid(), "gid": os.getgid()}
+        self.assertEqual(self.fs.chmod("/remote.md", 0o600), 0)
+        before = self.state.get_entry("/remote.md")
+        self.engine._node_from_entry = Mock()
+        response = Mock()
+        response._content_consumed = True
+        response.content = b"hello"
+        self.engine._open_remote_file = Mock(return_value=response)
+        self.engine.ensure_local_file("/remote.md")
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/remote.md").st_mode), 0o600)
+        self.engine._schedule_download = Mock()
+        self.engine._refresh_clean_entry(
+            self.state.get_entry("/remote.md"),
+            {**meta, "path": "/renamed.md", "remote_etag": "etag-2"},
+        )
+        self.engine.ensure_local_file("/renamed.md")
+        self.engine._reconcile_persistent_cache()
+        self.state.close()
+        self.state = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.fs.state = self.state
+        entry = self.state.get_entry("/renamed.md")
+        self.assertEqual(entry["dirty"], 0)
+        self.assertEqual(self._pending_ops(), [])
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/renamed.md").st_mode), 0o600)
+        self.assertEqual(self.fs.read("/renamed.md", 20, 0), b"hello")
+        self.mirror.remove_file("/renamed.md")
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/renamed.md").st_mode), 0o600)
+        self.assertEqual(before["hydrated"], 0)
+        self.assertEqual(before["dirty"], 0)
+
+    def test_unauthenticated_permission_mutations_are_rejected(self):
+        self.assertEqual(self.fs.create("/note.md", 0o600), 0)
+        before = self.state.get_entry("/note.md")
+        pending = self._pending_ops()
+        self.fs.api = None
+        self.assertEqual(self.fs.chmod("/note.md", 0o666), -errno.EACCES)
+        self.assertEqual(self.fs.create("/other.md", 0o600), -errno.EACCES)
+        self.assertEqual(self.fs.mkdir("/other", 0o700), -errno.EACCES)
+        self.assertEqual(self.fs.fsync("/note.md", 0), -errno.EACCES)
+        self.assertEqual(self.state.get_entry("/note.md"), before)
+        self.assertEqual(self._pending_ops(), pending)
+        self.assertFalse(self.mirror.exists("/other.md"))
+
+    def test_chmod_checks_owner_path_policy_and_existence(self):
+        self.assertEqual(self.fs.create("/note.md", 0o600), 0)
+        self.fs.GetContext.return_value = {"uid": 1066537, "gid": 1066537}
+        self.assertEqual(self.fs.chmod("/note.md", 0o666), -errno.EPERM)
+        self.assertEqual(self.fs.chmod("/missing.md", 0o600), -errno.ENOENT)
+        self.engine.sync_paths = ["/allowed"]
+        self.assertEqual(self.fs.chmod("/note.md", 0o666), -errno.EACCES)
+        self.assertEqual(self.fs.chmod("/allowed/../note.md", 0o666), -errno.EACCES)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/note.md").st_mode), 0o600)
+
+    def test_root_and_setgid_directory_modes(self):
+        self.fs.GetContext.return_value = {"uid": os.getuid(), "gid": 3001}
+        self.assertEqual(self.fs.chmod("/", 0o2775), 0)
+        self.assertEqual(self.fs.mkdir("/group", 0o755), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/group").st_mode), 0o2755)
+        self.assertEqual(self.fs.getattr("/group").st_gid, os.getgid())
+        self.assertEqual(self.fs.create("/group/file", 0o640), 0)
+        self.assertEqual(self.fs.getattr("/group/file").st_gid, os.getgid())
 
     def test_apply_permissions_config_controls_presented_attrs(self):
         self.fs.apply_permissions_config(

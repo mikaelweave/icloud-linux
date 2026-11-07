@@ -238,9 +238,10 @@ identity is persisted in the sync-state database so shared files survive restart
 and continue to upload/download correctly.
 
 **Presented ownership and permissions are configurable.** Add a `permissions:`
-block to your config to control the uid/gid and modes the mount presents. The
-on-disk mirror is chmod'd to match, so a container reading the mirror directory
-directly sees consistent ownership and permissions:
+block to your config to control the default uid/gid and modes for cloud files.
+New files and directories use the caller's UID/GID and requested creation mode
+(with the caller's umask applied by FUSE). `chmod`, including `fchmod`, changes
+the mounted permissions; `getattr` reports those modes and ownership.
 
 ```yaml
 permissions:
@@ -253,6 +254,20 @@ permissions:
 To let another user or container access the FUSE mount itself, set
 `fuse_options.allow_other: true`. On most hosts this also requires
 `user_allow_other` in `/etc/fuse.conf`.
+
+The mount always uses `default_permissions` so the kernel enforces POSIX access
+checks even with `allow_other`. A `0600` file is private to its creator, including
+when that creator is an unprivileged container user with a mapped host UID.
+Existing cloud files retain the configured defaults until explicitly changed.
+
+Mode and creator ownership are persisted locally in the sync-state database,
+survive hydration, cache normalization, renames and service restarts, and are
+not uploaded as iCloud metadata. Atomic replacement carries the staging file's
+permissions to the destination. The backing mirror continues to use configured
+cache modes and process ownership so the daemon can synchronize private or
+read-only mounted files. Share the FUSE mount, not the backing mirror: direct
+cache access bypasses both these permissions and sync tracking. `fsync` flushes
+local cached content; it does not confirm a cloud upload.
 
 ## Copying Files to Another Location
 
