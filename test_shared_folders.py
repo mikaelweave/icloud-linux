@@ -779,7 +779,8 @@ class PermissionConfigTests(unittest.TestCase):
         for mode in (0o600, 0o640, 0):
             with self.subTest(mode=oct(mode)), temporary_umask(0o077):
                 path = f"/note-{mode}.md"
-                self.assertEqual(self.fs.create(path, mode), 0)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                self.assertEqual(self.fs.lowwrap("create")(path, flags, stat.S_IFREG | mode), 0)
                 attrs = self.fs.getattr(path)
                 self.assertEqual(stat.S_IMODE(attrs.st_mode), mode)
                 self.assertEqual(attrs.st_uid, 1066536)
@@ -790,8 +791,8 @@ class PermissionConfigTests(unittest.TestCase):
 
     def test_safe_write_modes_survive_mutations_and_atomic_replacement(self):
         self.fs.apply_permissions_config({"file_mode": "0666", "dir_mode": "0777"})
-        self.assertEqual(self.fs.create("/final.md", 0o644), 0)
-        self.assertEqual(self.fs.create("/staging.tmp", 0o600), 0)
+        self.assertEqual(self.fs.create("/final.md", os.O_WRONLY, 0o644), 0)
+        self.assertEqual(self.fs.create("/staging.tmp", os.O_WRONLY, 0o600), 0)
         self.assertEqual(self.fs.chmod("/staging.tmp", 0o600), 0)
         self.assertEqual(self.fs.write("/staging.tmp", b"note\n", 0), 5)
         self.assertEqual(self.fs.truncate("/staging.tmp", 4), 0)
@@ -807,6 +808,12 @@ class PermissionConfigTests(unittest.TestCase):
         self.assertEqual(self.fs.read("/final.md", 20, 0), b"note")
         self.assertEqual(self.state.get_entry("/final.md"), {**before, "local_mode": 0o640})
         self.assertEqual(self._pending_ops(), pending)
+
+    def test_internal_creation_routes_use_binding_argument_order(self):
+        self.assertEqual(self.fs.mknod("/node.md", stat.S_IFREG | 0o640, 0), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/node.md").st_mode), 0o640)
+        self.assertEqual(self.fs.open("/opened.md", os.O_CREAT | os.O_WRONLY), 0)
+        self.assertEqual(stat.S_IMODE(self.fs.getattr("/opened.md").st_mode), 0o644)
 
     def test_chmod_preserves_clean_state_and_survives_download_refresh_and_remount(self):
         self.mirror.materialize_placeholder("/remote.md", 5, 123)
@@ -847,12 +854,12 @@ class PermissionConfigTests(unittest.TestCase):
         self.assertEqual(before["dirty"], 0)
 
     def test_unauthenticated_permission_mutations_are_rejected(self):
-        self.assertEqual(self.fs.create("/note.md", 0o600), 0)
+        self.assertEqual(self.fs.create("/note.md", os.O_WRONLY, 0o600), 0)
         before = self.state.get_entry("/note.md")
         pending = self._pending_ops()
         self.fs.api = None
         self.assertEqual(self.fs.chmod("/note.md", 0o666), -errno.EACCES)
-        self.assertEqual(self.fs.create("/other.md", 0o600), -errno.EACCES)
+        self.assertEqual(self.fs.create("/other.md", os.O_WRONLY, 0o600), -errno.EACCES)
         self.assertEqual(self.fs.mkdir("/other", 0o700), -errno.EACCES)
         self.assertEqual(self.fs.fsync("/note.md", 0), -errno.EACCES)
         self.assertEqual(self.state.get_entry("/note.md"), before)
@@ -860,7 +867,7 @@ class PermissionConfigTests(unittest.TestCase):
         self.assertFalse(self.mirror.exists("/other.md"))
 
     def test_chmod_checks_owner_path_policy_and_existence(self):
-        self.assertEqual(self.fs.create("/note.md", 0o600), 0)
+        self.assertEqual(self.fs.create("/note.md", os.O_WRONLY, 0o600), 0)
         self.fs.GetContext.return_value = {"uid": 1066537, "gid": 1066537}
         self.assertEqual(self.fs.chmod("/note.md", 0o666), -errno.EPERM)
         self.assertEqual(self.fs.chmod("/missing.md", 0o600), -errno.ENOENT)
@@ -875,7 +882,7 @@ class PermissionConfigTests(unittest.TestCase):
         self.assertEqual(self.fs.mkdir("/group", 0o755), 0)
         self.assertEqual(stat.S_IMODE(self.fs.getattr("/group").st_mode), 0o2755)
         self.assertEqual(self.fs.getattr("/group").st_gid, os.getgid())
-        self.assertEqual(self.fs.create("/group/file", 0o640), 0)
+        self.assertEqual(self.fs.create("/group/file", os.O_WRONLY, 0o640), 0)
         self.assertEqual(self.fs.getattr("/group/file").st_gid, os.getgid())
 
     def test_apply_permissions_config_controls_presented_attrs(self):

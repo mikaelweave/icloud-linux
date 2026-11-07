@@ -2350,7 +2350,7 @@ class ICloudFS(Fuse):
                 return -errno.EACCES
         if not self.state.get_entry(path):
             if flags & (os.O_CREAT | os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC):
-                return self.create(path, 0o644, flags)
+                return self.create(path, flags, 0o644)
             return -errno.ENOENT
 
         entry = self.state.get_entry(path)
@@ -2371,7 +2371,7 @@ class ICloudFS(Fuse):
         return 0
 
     @state_locked
-    def create(self, path, mode, flags=None):
+    def create(self, path, flags, mode):
         if not self._is_authenticated():
             return -errno.EACCES
         if not self._mutation_allowed("create", path):
@@ -2673,7 +2673,7 @@ class ICloudFS(Fuse):
     def mknod(self, path, mode, dev):
         if not stat.S_ISREG(mode):
             return -errno.ENOSYS
-        return self.create(path, mode)
+        return self.create(path, os.O_WRONLY | os.O_CREAT, mode)
 
     @state_locked
     def utime(self, path, times):

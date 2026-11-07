@@ -956,9 +956,9 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         return self.state.conn.execute("SELECT COUNT(*) FROM pending_ops").fetchone()[0]
 
     def test_allowed_mutations_are_accepted(self):
-        self.assertEqual(self.fs.create("/allowed/queued.txt", 0o644), 0)
+        self.assertEqual(self.fs.create("/allowed/queued.txt", os.O_WRONLY, 0o644), 0)
         self.assertEqual(self.fs.mkdir("/allowed/newdir", 0o755), 0)
-        self.assertEqual(self.fs.create("/allowed/newdir/file.txt", 0o644), 0)
+        self.assertEqual(self.fs.create("/allowed/newdir/file.txt", os.O_WRONLY, 0o644), 0)
         self.assertEqual(self.fs.write("/allowed/newdir/file.txt", b"hello", 0), 5)
         self.assertEqual(self.fs.truncate("/allowed/newdir/file.txt", 2), 0)
         self.assertEqual(
@@ -971,7 +971,7 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
 
     def test_atomic_file_replacement_preserves_destination_remote_identity(self):
         self._add_entry("/allowed/note.md", content=b"old")
-        self.assertEqual(self.fs.create("/allowed/note.md.tmp", 0o644), 0)
+        self.assertEqual(self.fs.create("/allowed/note.md.tmp", os.O_WRONLY, 0o644), 0)
         self.assertEqual(self.fs.write("/allowed/note.md.tmp", b"new", 0), 3)
 
         result = self.fs.rename("/allowed/note.md.tmp", "/allowed/note.md")
@@ -1008,7 +1008,7 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         )
 
     def test_rename_type_collision_returns_native_errno(self):
-        self.assertEqual(self.fs.create("/allowed/source.md", 0o644), 0)
+        self.assertEqual(self.fs.create("/allowed/source.md", os.O_WRONLY, 0o644), 0)
         self.assertEqual(self.fs.mkdir("/allowed/destination", 0o755), 0)
 
         result = self.fs.rename("/allowed/source.md", "/allowed/destination")
@@ -1026,7 +1026,7 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         entry_paths_before = [entry["path"] for entry in self.state.list_entries()]
 
         attempts = [
-            self.fs.create("/allowed/excluded/new.txt", 0o644),
+            self.fs.create("/allowed/excluded/new.txt", os.O_WRONLY, 0o644),
             self.fs.write("/outside/file.txt", b"changed", 0),
             self.fs.truncate("/allowed/excluded/file.txt", 0),
             self.fs.mkdir("/outside/newdir", 0o755),
