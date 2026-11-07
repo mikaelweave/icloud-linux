@@ -184,11 +184,17 @@ class NamedFileStream:
         self._handle = handle
         self.name = name
 
+    # Defined explicitly (not via __getattr__) so the object satisfies
+    # requests' `isinstance(fp, _SupportsRead)` check. That check is a
+    # runtime_checkable Protocol, which on Python 3.12+ inspects the class
+    # rather than __getattr__; without a real method requests treats the
+    # stream as raw data and the upload fails with "a bytes-like object is
+    # required, not 'NamedFileStream'".
+    def read(self, *args, **kwargs):
+        return self._handle.read(*args, **kwargs)
+
     def __getattr__(self, attr):
         return getattr(self._handle, attr)
-
-    def read(self, size=-1):
-        return self._handle.read(size)
 
 
 class SyncState:
@@ -965,7 +971,12 @@ class ICloudSyncEngine:
         self.hydration_total = 0
         self.hydration_completed = 0
         self.hydration_progress_lock = threading.Lock()
-        self.shutdown_lock = threading.Lock()
+        # Reentrant: shutdown() runs on the main thread from three places (the
+        # finally: after fs.main(), the atexit hook, and the SIGTERM/SIGINT
+        # handler). Python runs signal handlers on the main thread, so a signal
+        # arriving while shutdown() is already in progress re-enters it. With a
+        # plain Lock that self-deadlocks against a frame that can never resume.
+        self.shutdown_lock = threading.RLock()
         self.is_shutdown = False
         # PyiCloud downloads appear sensitive to concurrent use of one session.
         self.download_semaphore = threading.Semaphore(1)
@@ -1027,8 +1038,9 @@ class ICloudSyncEngine:
         return self.state.count_entries() > 0 and os.path.isdir(self.mirror.root)
 
     def initial_scan(self):
+        crawl_started_at = int(time.time())
         snapshot = self._crawl_remote_snapshot()
-        self._apply_remote_snapshot(snapshot)
+        self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
 
     def _reconcile_persistent_cache(self):
         entries = self.state.list_entries()
@@ -1253,7 +1265,7 @@ class ICloudSyncEngine:
         return snapshot
 
     @state_locked
-    def _apply_remote_snapshot(self, snapshot):
+    def _apply_remote_snapshot(self, snapshot, crawl_started_at=None):
         remote_ids = set(snapshot.keys())
 
         for meta in snapshot.values():
@@ -1281,6 +1293,17 @@ class ICloudSyncEngine:
             if entry["dirty"]:
                 self.logger.warning("Remote deleted dirty path %s; keeping local copy for upload", entry["path"])
                 self.state.clear_remote_identity(entry["path"])
+                continue
+            synced_at = entry.get("last_synced_at")
+            if (
+                crawl_started_at is not None
+                and synced_at is not None
+                and synced_at >= crawl_started_at
+            ):
+                self.logger.info(
+                    "Keeping %s because it synced during the remote crawl",
+                    entry["path"],
+                )
                 continue
             self.logger.info("Removing clean path deleted remotely: %s", entry["path"])
             self.mirror.remove_tree(entry["path"])
@@ -1521,8 +1544,9 @@ class ICloudSyncEngine:
     def _run_remote_refresh(self, reason):
         try:
             self._log_sync("refresh-start", reason=reason)
+            crawl_started_at = int(time.time())
             snapshot = self._crawl_remote_snapshot()
-            self._apply_remote_snapshot(snapshot)
+            self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
             self._log_sync("refresh-complete", reason=reason)
         except Exception as exc:
             self.logger.error("Remote refresh failed (%s): %s", reason, exc)
@@ -2079,9 +2103,6 @@ class ICloudFS(Fuse):
         self.file_mode = DEFAULT_FILE_MODE
         self.dir_mode = DEFAULT_DIR_MODE
 
-    def _is_directory_type(self, node_type):
-        return (node_type or "").lower() in DIRECTORY_NODE_TYPES
-
     def apply_fuse_options(self, fuse_options):
         if not fuse_options:
             return
@@ -2195,7 +2216,7 @@ class ICloudFS(Fuse):
         try:
             # Resolve Apple account partition (fixes 421 redirect for non-default shards)
             import requests as _req
-            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
+            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={}, timeout=10)
             _partition = _r.headers.get("x-apple-user-partition")
 
             self.api = PyiCloudService(username, password,
@@ -2258,6 +2279,10 @@ class ICloudFS(Fuse):
     def _is_authenticated(self):
         """Return True if a live iCloud session is available."""
         return self.api is not None
+
+    def _is_directory_type(self, entry_type):
+        """Return True for directory-like entry types, even in offline mode."""
+        return entry_type in DIRECTORY_NODE_TYPES
 
     def init_local_cache(
         self,
@@ -2590,9 +2615,23 @@ class ICloudFS(Fuse):
             return -errno.EACCES
         if not self._mutation_allowed("rename", oldpath, newpath):
             return -errno.EACCES
-        entry = self.state.get_entry(oldpath)
+        sync_engine = self.sync_engine
+        state = self.state
+        if sync_engine is None or state is None:
+            return -errno.EACCES
+        entry = state.get_entry(oldpath)
         if not entry:
             return -errno.ENOENT
+
+        if sync_engine._is_directory_type(entry["type"]):
+            old_root = normalize_icloud_path(oldpath)
+            new_root = normalize_icloud_path(newpath)
+            for descendant in state._fetch_subtree(old_root):
+                source_path = normalize_icloud_path(descendant["path"])
+                suffix = source_path[len(old_root) :]
+                target_path = normalize_icloud_path(new_root + suffix)
+                if not self._mutation_allowed("rename", source_path, target_path):
+                    return -errno.EACCES
 
         try:
             existing = self.state.get_entry(newpath)
@@ -2694,6 +2733,13 @@ class ICloudFS(Fuse):
         except Exception as exc:
             self.logger.error("Error setting utime for %s: %s", path, exc)
             return -errno.EIO
+
+    def chown(self, path, uid, gid):
+        """Accept Unix ownership updates that iCloud Drive cannot persist."""
+        if self.state is None or self.state.get_entry(path) is None:
+            return -errno.ENOENT
+        self._log_file_op("chown", path, uid=uid, gid=gid, ignored=True)
+        return 0
 
     def statfs(self):
         stats = self.mirror.statvfs()
