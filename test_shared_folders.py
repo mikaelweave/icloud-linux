@@ -230,7 +230,7 @@ class SharedFolderEngineTests(unittest.TestCase):
                 "remote_zone": "zone-1",
                 "remote_shareid": shareid,
                 "remote_itemid": "item-shared",
-                "size": 13,
+                "size": 14,
                 "mtime": 123,
                 "hydrated": False,
                 "dirty": False,

@@ -4,6 +4,7 @@ import atexit
 import datetime
 import errno
 import hashlib
+import io
 import json
 import logging
 import os
@@ -16,9 +17,10 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 import fuse
 import yaml
@@ -45,6 +47,14 @@ DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
 DEFAULT_FILE_MODE = 0o644
 DEFAULT_DIR_MODE = 0o755
+
+
+def state_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.state.lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 def normalize_icloud_path(path):
@@ -789,32 +799,42 @@ class LocalMirror:
         os.utime(local, (mtime, mtime))
         self._normalize_file_path(local)
 
-    def write_atomic_bytes(self, path, content, mtime=None):
-        self.ensure_parent(path)
-        local = self.local_path(path)
-        fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
-            os.replace(tmp_path, local)
-            if mtime is not None:
-                os.utime(local, (mtime, mtime))
-            self._normalize_file_path(local)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+    def write_atomic_bytes(
+        self, path, content, mtime=None, *, expected_size=None, publication_guard=None
+    ):
+        self.write_atomic_stream(
+            path, io.BytesIO(content), mtime,
+            expected_size=expected_size, publication_guard=publication_guard,
+        )
 
-    def write_atomic_stream(self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE):
+    def write_atomic_stream(
+        self, path, source, mtime=None, chunk_size=IO_CHUNK_SIZE, *,
+        expected_size=None, publication_guard=None,
+    ):
         self.ensure_parent(path)
         local = self.local_path(path)
         fd, tmp_path = tempfile.mkstemp(dir=self.tmp_dir)
         try:
             with os.fdopen(fd, "wb") as handle:
-                shutil.copyfileobj(source, handle, length=chunk_size)
-            os.replace(tmp_path, local)
+                size = 0
+                while True:
+                    chunk = source.read(chunk_size)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if expected_size is not None and size > expected_size:
+                        raise OSError(errno.EIO, f"Download exceeds expected size for {path}")
+                    handle.write(chunk)
+                if expected_size is not None and size != expected_size:
+                    raise OSError(
+                        errno.EIO,
+                        f"Download size mismatch for {path}: expected {expected_size}, got {size}",
+                    )
             if mtime is not None:
-                os.utime(local, (mtime, mtime))
-            self._normalize_file_path(local)
+                os.utime(tmp_path, (mtime, mtime))
+            os.chmod(tmp_path, self.file_mode)
+            with publication_guard if publication_guard is not None else nullcontext():
+                os.replace(tmp_path, local)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -1067,11 +1087,23 @@ class ICloudSyncEngine:
     def _is_directory_type(self, node_type):
         return (node_type or "").lower() in DIRECTORY_NODE_TYPES
 
+    @contextmanager
+    def _hydration_publication_guard(self, path, entry):
+        with self.state.lock:
+            if self.state.get_entry(path) != entry:
+                raise OSError(errno.EAGAIN, f"Entry changed during download for {path}")
+            yield
+            stats = self.mirror.stat_local(path)
+            checksum = self.mirror.file_sha256(path)
+            self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
+
     def ensure_local_file(self, path):
         if not self._path_allowed(path):
             return
         entry = self.state.get_entry(path)
         if not entry or entry["type"] != "file" or entry["tombstone"]:
+            return
+        if entry["dirty"] and (entry["hydrated"] or entry.get("local_sha256")):
             return
         if entry["hydrated"] and self.mirror.exists(path):
             return
@@ -1080,6 +1112,8 @@ class ICloudSyncEngine:
         with lock:
             entry = self.state.get_entry(path)
             if not entry or entry["type"] != "file" or entry["tombstone"]:
+                return
+            if entry["dirty"] and (entry["hydrated"] or entry.get("local_sha256")):
                 return
             if entry["hydrated"] and self.mirror.exists(path):
                 return
@@ -1118,14 +1152,18 @@ class ICloudSyncEngine:
                 )
                 node = self._node_from_entry(entry)
                 with closing(self._open_remote_file(node, entry, path, stream=True)) as response:
+                    guard = self._hydration_publication_guard(path, entry)
                     if response._content_consumed is True:
-                        self.mirror.write_atomic_bytes(path, response.content, entry["mtime"])
+                        self.mirror.write_atomic_bytes(
+                            path, response.content, entry["mtime"],
+                            expected_size=entry["size"], publication_guard=guard,
+                        )
                     else:
-                        self.mirror.write_atomic_stream(path, response.raw, entry["mtime"])
-            stats = self.mirror.stat_local(path)
-            checksum = self.mirror.file_sha256(path)
-            self.state.mark_hydrated(path, checksum, stats.st_size, int(stats.st_mtime))
-            self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=stats.st_size)
+                        self.mirror.write_atomic_stream(
+                            path, response.raw, entry["mtime"],
+                            expected_size=entry["size"], publication_guard=guard,
+                        )
+            self._log_sync("hydrate-complete", level=logging.INFO, path=path, source="remote", size=entry["size"])
 
     def _crawl_remote_snapshot(self):
         self.logger.info("Starting remote metadata crawl")
@@ -1202,6 +1240,7 @@ class ICloudSyncEngine:
         )
         return snapshot
 
+    @state_locked
     def _apply_remote_snapshot(self, snapshot):
         remote_ids = set(snapshot.keys())
 
@@ -2300,6 +2339,7 @@ class ICloudFS(Fuse):
                 return -errno.EIO
         return 0
 
+    @state_locked
     def create(self, path, mode, flags=None):
         if not self._is_authenticated():
             return -errno.EACCES
@@ -2362,27 +2402,29 @@ class ICloudFS(Fuse):
                 return -errno.EIO
 
         try:
-            written = self.mirror.write(path, buf, offset)
-            stats = self.mirror.stat_local(path)
-            checksum = self.mirror.file_sha256(path)
-            if not entry:
-                self.state.upsert_entry(
-                    {
-                        "path": path,
-                        "type": "file",
-                        "parent_path": os.path.dirname(path) or "/",
-                        "size": stats.st_size,
-                        "mtime": int(stats.st_mtime),
-                        "hydrated": True,
-                        "dirty": True,
-                        "tombstone": False,
-                        "local_sha256": checksum,
-                        "synced_path": None,
-                    }
-                )
-            else:
-                self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
-            self.state.queue_op("update", path)
+            with self.state.lock:
+                entry = self.state.get_entry(path)
+                written = self.mirror.write(path, buf, offset)
+                stats = self.mirror.stat_local(path)
+                checksum = self.mirror.file_sha256(path)
+                if not entry:
+                    self.state.upsert_entry(
+                        {
+                            "path": path,
+                            "type": "file",
+                            "parent_path": os.path.dirname(path) or "/",
+                            "size": stats.st_size,
+                            "mtime": int(stats.st_mtime),
+                            "hydrated": True,
+                            "dirty": True,
+                            "tombstone": False,
+                            "local_sha256": checksum,
+                            "synced_path": None,
+                        }
+                    )
+                else:
+                    self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
+                self.state.queue_op("update", path)
             self._log_file_op("write", path, size=len(buf), offset=offset, written=written)
             return written
         except Exception as exc:
@@ -2395,6 +2437,7 @@ class ICloudFS(Fuse):
     def release(self, path, flags):
         return 0
 
+    @state_locked
     def mkdir(self, path, mode):
         if not self._is_authenticated():
             return -errno.EACCES
@@ -2423,6 +2466,7 @@ class ICloudFS(Fuse):
             self.logger.error("Error creating directory %s: %s", path, exc)
             return -errno.EIO
 
+    @state_locked
     def rmdir(self, path):
         if not self._is_authenticated():
             return -errno.EACCES
@@ -2447,6 +2491,7 @@ class ICloudFS(Fuse):
             self.logger.error("Error removing directory %s: %s", path, exc)
             return -errno.EIO
 
+    @state_locked
     def unlink(self, path):
         if not self._is_authenticated():
             return -errno.EACCES
@@ -2472,6 +2517,7 @@ class ICloudFS(Fuse):
             self.logger.error("Error unlinking %s: %s", path, exc)
             return -errno.EIO
 
+    @state_locked
     def rename(self, oldpath, newpath):
         if not self._is_authenticated():
             return -errno.EACCES
@@ -2528,27 +2574,29 @@ class ICloudFS(Fuse):
                 return -errno.EIO
 
         try:
-            self.mirror.truncate(path, length)
-            stats = self.mirror.stat_local(path)
-            checksum = self.mirror.file_sha256(path)
-            if not entry:
-                self.state.upsert_entry(
-                    {
-                        "path": path,
-                        "type": "file",
-                        "parent_path": os.path.dirname(path) or "/",
-                        "size": stats.st_size,
-                        "mtime": int(stats.st_mtime),
-                        "hydrated": True,
-                        "dirty": True,
-                        "tombstone": False,
-                        "local_sha256": checksum,
-                        "synced_path": None,
-                    }
-                )
-            else:
-                self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
-            self.state.queue_op("update", path)
+            with self.state.lock:
+                entry = self.state.get_entry(path)
+                self.mirror.truncate(path, length)
+                stats = self.mirror.stat_local(path)
+                checksum = self.mirror.file_sha256(path)
+                if not entry:
+                    self.state.upsert_entry(
+                        {
+                            "path": path,
+                            "type": "file",
+                            "parent_path": os.path.dirname(path) or "/",
+                            "size": stats.st_size,
+                            "mtime": int(stats.st_mtime),
+                            "hydrated": True,
+                            "dirty": True,
+                            "tombstone": False,
+                            "local_sha256": checksum,
+                            "synced_path": None,
+                        }
+                    )
+                else:
+                    self.state.mark_dirty(path, stats.st_size, int(stats.st_mtime), 1, checksum)
+                self.state.queue_op("update", path)
             self._log_file_op("truncate", path, length=length)
             return 0
         except Exception as exc:
@@ -2560,6 +2608,7 @@ class ICloudFS(Fuse):
             return -errno.ENOSYS
         return self.create(path, mode)
 
+    @state_locked
     def utime(self, path, times):
         if not self._is_authenticated():
             return -errno.EACCES

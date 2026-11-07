@@ -5,11 +5,12 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock
 from requests.models import RequestEncodingMixin, Response
 
-from driver import ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
+from driver import IO_CHUNK_SIZE, ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
 
 
@@ -17,6 +18,20 @@ class NoUnboundedReadStream(io.BytesIO):
     def read(self, size=-1):
         if size is None or size < 0:
             raise AssertionError("stream was read without a chunk size")
+        return super().read(size)
+
+
+class CallbackReadStream(NoUnboundedReadStream):
+    def __init__(self, content, callback=None):
+        super().__init__(content)
+        self.callback = callback
+        self.read_sizes = []
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        if self.callback is not None:
+            callback, self.callback = self.callback, None
+            callback()
         return super().read(size)
 
 
@@ -571,6 +586,274 @@ class SyncEngineStartupTests(unittest.TestCase):
                 self.assertEqual(entry["size"], 0)
                 self.assertEqual(entry["hydrated"], 1)
                 self.assertEqual(entry["dirty"], 0)
+
+    def _prepare_integrity_download(self, payload, expected_size=5, consumed=False, callback=None):
+        path = "/docs/integrity.txt"
+        self.mirror.write_atomic_bytes(path, b"cached bytes", mtime=100)
+        self.state.upsert_entry(
+            {
+                "path": path,
+                "type": "file",
+                "parent_path": "/docs",
+                "remote_drivewsid": "file-1",
+                "remote_docwsid": "doc-1",
+                "remote_etag": "metadata-etag",
+                "remote_zone": "zone-1",
+                "remote_itemid": "item-1",
+                "remote_unified_token": "token-1",
+                "size": expected_size,
+                "mtime": 123,
+                "local_sha256": "previous-checksum",
+                "hydrated": False,
+                "dirty": False,
+                "tombstone": False,
+            }
+        )
+        response = Response()
+        response.status_code = 200
+        response.headers["Content-Length"] = str(len(payload))
+        response.headers["ETag"] = "unrelated-http-etag"
+        response.raw = CallbackReadStream(payload, callback)
+        if consumed:
+            self.assertEqual(response.content, payload)
+        response.close = Mock(wraps=response.close)
+        self.engine._open_remote_file = Mock(return_value=response)
+        return path, response
+
+    def test_hydration_rejects_size_mismatch_without_changing_cache_or_metadata(self):
+        for consumed in (False, True):
+            for payload, expected_size in ((b"", 5), (b"four", 5), (b"longer", 5), (b"x", 0)):
+                with self.subTest(consumed=consumed, payload=payload, expected_size=expected_size):
+                    path, response = self._prepare_integrity_download(
+                        payload, expected_size, consumed
+                    )
+                    before = self.state.get_entry(path)
+                    with self.assertRaises(OSError):
+                        self.engine.ensure_local_file(path)
+                    self.assertEqual(self.mirror.read(path, 100, 0), b"cached bytes")
+                    self.assertEqual(self.state.get_entry(path), before)
+                    self.assertEqual(self.state.get_entry(path)["hydrated"], 0)
+                    self.assertEqual(self.state.get_entry(path)["dirty"], 0)
+                    self.assertEqual(self.state.get_entry(path)["size"], expected_size)
+                    self.assertEqual(int(self.mirror.stat_local(path).st_mtime), 100)
+                    self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+                    response.close.assert_called_once()
+                    if not consumed:
+                        self.assertTrue(response.raw.closed)
+
+    def test_hydration_skips_already_dirty_entry(self):
+        path, response = self._prepare_integrity_download(b"valid")
+        self.state.mark_dirty(path)
+        before = self.state.get_entry(path)
+
+        self.engine.ensure_local_file(path)
+
+        self.assertEqual(self.mirror.read(path, 100, 0), b"cached bytes")
+        self.assertEqual(self.state.get_entry(path), before)
+        self.engine._open_remote_file.assert_not_called()
+        self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+
+    def test_hydration_rejects_state_changes_during_download(self):
+        changes = {
+            "dirty": 1,
+            "tombstone": 1,
+            "hydrated": 1,
+            "type": "folder",
+            "parent_path": "/other",
+            "synced_path": "/other/integrity.txt",
+            "remote_drivewsid": "file-2",
+            "remote_docwsid": "doc-2",
+            "remote_etag": "new-metadata-etag",
+            "remote_zone": "zone-2",
+            "remote_shareid": {"zone": "shared-zone"},
+            "remote_itemid": "item-2",
+            "remote_unified_token": "token-2",
+            "size": 10,
+            "mtime": 456,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                changed = {}
+
+                def mutate():
+                    entry = self.state.get_entry(path)
+                    self.state.upsert_entry({**entry, field: value})
+                    changed["entry"] = self.state.get_entry(path)
+                    if field == "dirty":
+                        self.mirror.write_atomic_bytes(path, b"local edit", mtime=200)
+
+                path, response = self._prepare_integrity_download(b"valid", callback=mutate)
+                with self.assertRaises(OSError):
+                    self.engine.ensure_local_file(path)
+                expected = b"local edit" if field == "dirty" else b"cached bytes"
+                self.assertEqual(self.mirror.read(path, 100, 0), expected)
+                self.assertEqual(self.state.get_entry(path), changed["entry"])
+                self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+                response.close.assert_called_once()
+                self.assertTrue(response.raw.closed)
+
+    def test_write_after_placeholder_rename_preserves_remote_content(self):
+        path, response = self._prepare_integrity_download(b"hello")
+        entry = self.state.get_entry(path)
+        self.state.upsert_entry({**entry, "local_sha256": None, "synced_path": path})
+        self.mirror.materialize_placeholder(path, 5, 123)
+        fs = ICloudFS.__new__(ICloudFS)
+        fs.state = self.state
+        fs.mirror = self.mirror
+        fs.sync_engine = self.engine
+        fs.logger = Mock()
+        fs._is_authenticated = Mock(return_value=True)
+        fs._mutation_allowed = Mock(return_value=True)
+        renamed = "/docs/renamed.txt"
+
+        self.assertEqual(fs.rename(path, renamed), 0)
+        queued = self.state.conn.execute("SELECT * FROM pending_ops").fetchall()
+        self.engine.ensure_local_file(renamed)
+
+        self.assertEqual(self.mirror.read(renamed, 100, 0), b"hello")
+        self.assertEqual(self.state.get_entry(renamed)["dirty"], 1)
+        self.assertEqual(self.state.get_entry(renamed)["synced_path"], path)
+        self.assertEqual(self.state.conn.execute("SELECT * FROM pending_ops").fetchall(), queued)
+        self.assertEqual(fs.write(renamed, b"X", 0), 1)
+        self.assertEqual(self.mirror.read(renamed, 100, 0), b"Xello")
+        self.assertEqual(self.state.get_entry(renamed)["dirty"], 1)
+        response.close.assert_called_once()
+
+    def test_hydration_rejects_deleted_or_moved_entry_during_download(self):
+        for move in (False, True):
+            with self.subTest(move=move):
+                def mutate():
+                    if move:
+                        self.state.rename_tree(path, "/docs/moved.txt")
+                        self.mirror.rename_path(path, "/docs/moved.txt")
+                    else:
+                        self.state.remove_entry(path)
+
+                path, response = self._prepare_integrity_download(b"valid", callback=mutate)
+                with self.assertRaises(OSError):
+                    self.engine.ensure_local_file(path)
+                self.assertIsNone(self.state.get_entry(path))
+                if move:
+                    self.assertFalse(self.mirror.exists(path))
+                    self.assertEqual(self.mirror.read("/docs/moved.txt", 100, 0), b"cached bytes")
+                    self.assertEqual(self.state.get_entry("/docs/moved.txt")["hydrated"], 0)
+                else:
+                    self.assertEqual(self.mirror.read(path, 100, 0), b"cached bytes")
+                self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+                response.close.assert_called_once()
+
+    def test_hydration_stream_error_preserves_cache_and_closes_response(self):
+        def fail():
+            raise OSError("download interrupted")
+
+        def interrupt_next_read():
+            response.raw.callback = fail
+
+        path, response = self._prepare_integrity_download(b"valid", callback=interrupt_next_read)
+        before = self.state.get_entry(path)
+        with self.assertRaisesRegex(OSError, "download interrupted"):
+            self.engine.ensure_local_file(path)
+        self.assertEqual(self.mirror.read(path, 100, 0), b"cached bytes")
+        self.assertEqual(self.state.get_entry(path), before)
+        self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+        response.close.assert_called_once()
+        self.assertTrue(response.raw.closed)
+
+    def test_hydration_cannot_resurrect_in_progress_fuse_unlink(self):
+        publication_attempted = threading.Event()
+        local_removed = threading.Event()
+        download_finished = threading.Event()
+        publication_acquired = []
+        errors = []
+        original_lock = self.state.lock
+
+        class ObservedLock:
+            def __enter__(self):
+                if (
+                    threading.current_thread().name == "integrity-download"
+                    and local_removed.is_set()
+                    and not publication_attempted.is_set()
+                ):
+                    acquired = original_lock.acquire(blocking=False)
+                    publication_acquired.append(acquired)
+                    publication_attempted.set()
+                    if not acquired:
+                        original_lock.acquire()
+                else:
+                    original_lock.acquire()
+                return self
+
+            def __exit__(self, *args):
+                original_lock.release()
+
+        self.state.lock = ObservedLock()
+        fs = ICloudFS.__new__(ICloudFS)
+        fs.state = self.state
+        fs.mirror = self.mirror
+        fs.logger = Mock()
+        fs._is_authenticated = Mock(return_value=True)
+        fs._mutation_allowed = Mock(return_value=True)
+        original_remove = self.mirror.remove_file
+
+        def remove_and_pause(target):
+            original_remove(target)
+            local_removed.set()
+            if not publication_attempted.wait(5):
+                raise AssertionError("Download did not attempt publication")
+            if publication_acquired[0] and not download_finished.wait(5):
+                raise AssertionError("Unprotected publication did not finish")
+
+        self.mirror.remove_file = remove_and_pause
+        results = []
+
+        def unlink():
+            results.append(fs.unlink(path))
+
+        remover = threading.Thread(target=unlink, name="integrity-unlink")
+
+        def start_unlink():
+            remover.start()
+            if not local_removed.wait(5):
+                raise AssertionError("FUSE unlink did not reach the filesystem")
+
+        path, response = self._prepare_integrity_download(b"valid", callback=start_unlink)
+
+        def hydrate():
+            try:
+                self.engine.ensure_local_file(path)
+            except OSError as exc:
+                errors.append(exc)
+            finally:
+                download_finished.set()
+
+        downloader = threading.Thread(target=hydrate, name="integrity-download")
+        downloader.start()
+        downloader.join(10)
+        remover.join(10)
+        self.assertFalse(downloader.is_alive())
+        self.assertFalse(remover.is_alive())
+        self.assertEqual(results, [0])
+        self.assertEqual([exc.errno for exc in errors], [errno.EAGAIN])
+        self.assertFalse(self.mirror.exists(path))
+        self.assertEqual(self.state.get_entry(path)["dirty"], 1)
+        self.assertEqual(self.state.get_entry(path)["tombstone"], 1)
+        self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
+        response.close.assert_called_once()
+
+    def test_hydration_large_download_keeps_streaming_bounded(self):
+        payload = b"x" * (2 * IO_CHUNK_SIZE + 17)
+        path, response = self._prepare_integrity_download(payload, len(payload))
+        response.headers["Content-Length"] = "1"
+
+        self.engine.ensure_local_file(path)
+
+        self.assertEqual(self.mirror.read(path, len(payload), 0), payload)
+        self.assertEqual(self.state.get_entry(path)["hydrated"], 1)
+        self.assertEqual(self.state.get_entry(path)["size"], len(payload))
+        self.assertGreater(len(response.raw.read_sizes), 2)
+        self.assertTrue(all(0 < size <= IO_CHUNK_SIZE for size in response.raw.read_sizes))
+        response.close.assert_called_once()
+        self.assertEqual(os.listdir(self.mirror.tmp_dir), [])
 
     def test_sync_file_uploads_stream_without_buffering_entire_file(self):
         self.mirror.create_file("/docs/a.txt")
