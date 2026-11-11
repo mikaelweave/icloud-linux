@@ -3,8 +3,5 @@
 --no-binary=fuse-python
 fuse-python==1.0.9
 pyyaml
-pyicloud>=2.6.4
-# pyicloud 2.7.0 imports its Notes renderer from the core package, but
-# declares rich only in optional extras. Keep fresh installs importable.
-rich>=15.0.0
+pyicloud==2026.10.1
 jsonpickle

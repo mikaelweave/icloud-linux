@@ -50,7 +50,7 @@ If you want a quick setup and do not care about the internal details, use `./icl
 You need:
 
 - Linux
-- Python 3 with `venv`
+- Python 3.10 or later with `venv`
 - FUSE
 - `systemctl --user`
 
@@ -113,6 +113,17 @@ If Apple expires your session, run:
 ./icloudctl restart
 ```
 
+Existing installations can update the Python dependencies without recreating
+their configuration or service:
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+The pinned pyicloud release avoids repeated delivery requests within one
+authentication challenge. Apple can still require a new code when a session
+expires or a different delivery method is selected.
+
 If Apple reports that updated terms of service must be accepted, run:
 
 ```bash
@@ -121,11 +132,14 @@ If Apple reports that updated terms of service must be accepted, run:
 
 ### iOS 26 Beta 2FA Workaround
 
-iOS 26 beta may deliver a push notification popup instead of a numeric 2FA code. If this happens, use the `--force-sms` flag to bypass the push path and request an SMS code directly:
+iOS 26 beta may deliver a push notification popup instead of a numeric 2FA code. If this happens, use `--force-sms` to request an SMS code:
 
 ```bash
 ./icloudctl auth --force-sms
 ```
+
+Apple may send a device prompt during sign-in before the SMS request. If
+sign-in already requested an SMS, the command does not request another one.
 
 Use `--debug` to see Apple's reported auth mode and diagnose delivery issues:
 
