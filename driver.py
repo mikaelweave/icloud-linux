@@ -2233,8 +2233,8 @@ class ICloudFS(Fuse):
                     code = input("Enter the verification code: ").strip()
                     result = self.api.validate_2fa_code(code)
                     print("Result: %s" % result)
-                    if result and not self.api.is_trusted_session:
-                        self.api.trust_session()
+                    if not result or not self.api.is_trusted_session:
+                        raise RuntimeError("2FA code verification or session trust failed.")
                 else:
                     raise RuntimeError(
                         "2FA required, but no interactive terminal is available. "

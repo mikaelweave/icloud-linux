@@ -4,8 +4,8 @@ auth.py — icloud-linux one-time authentication bootstrap.
 
 Modes:
   1. Normal (default): triggers Apple's preferred 2FA delivery (push to device)
-  2. --force-sms: bypasses push delivery and forces an SMS code to your trusted
-     phone number — useful when iOS beta push doesn't show a numeric code
+  2. --force-sms: requests an SMS code to your trusted phone number after
+     sign-in — useful when iOS beta push doesn't show a numeric code
   3. --trust-token <value>: inject a browser trust-token extracted from
      icloud.com DevTools → Application → Cookies → X-APPLE-WEBAUTH-HSA-TRUST
   4. --accept-terms: accept Apple's updated iCloud terms of service
@@ -19,18 +19,13 @@ Usage:
 
 iOS 26 beta workaround:
   If Apple is sending a push popup instead of a numeric code, use --force-sms.
-  This PUTs directly to /appleauth/auth/verify/phone with mode=sms, bypassing
-  the push/trusted-device bridge that iOS 26 beta fails to complete.
 """
 import os
 import sys
 import yaml
 import requests
 from pyicloud import PyiCloudService
-from pyicloud.exceptions import (
-    PyiCloud2FARequiredException,
-    PyiCloudAPIResponseException,
-)
+from pyicloud.exceptions import PyiCloud2FARequiredException
 
 
 def load_config(path):
@@ -71,21 +66,6 @@ def print_auth_diagnostics(api):
     print("------------------------\n")
 
 
-def sms_code_was_accepted(exc):
-    """Recognize Apple's HTTP 409 response for an accepted SMS code."""
-    response = getattr(exc, "response", None)
-    if response is None or response.status_code != 409:
-        return False
-    try:
-        payload = response.json()
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    security_code = payload.get("securityCode")
-    return isinstance(security_code, dict) and security_code.get("valid") is True
-
-
 def do_sms_forced(api):
     """Force SMS delivery regardless of what push_mode Apple reported.
 
@@ -95,9 +75,12 @@ def do_sms_forced(api):
     """
     print("\nForcing SMS delivery to your trusted phone number...")
     try:
-        sent = api._request_sms_2fa_code()
-    except Exception as exc:
-        print(f"ERROR triggering SMS: {exc}", file=sys.stderr)
+        sent = (
+            api._two_factor_code_requested
+            and api.two_factor_delivery_method == "sms"
+        ) or api._request_sms_2fa_code()
+    except Exception:
+        print("ERROR triggering SMS.", file=sys.stderr)
         sys.exit(1)
 
     if not sent:
@@ -107,14 +90,8 @@ def do_sms_forced(api):
     print("SMS sent.  Check your phone for a 6-digit code.")
     code = input("Enter 2FA code: ").strip()
 
-    # _validate_sms_code is the correct path when delivery mode is sms
     try:
-        api._validate_sms_code(code)
-    except PyiCloudAPIResponseException as exc:
-        if not sms_code_was_accepted(exc):
-            print("Code validation failed.", file=sys.stderr)
-            sys.exit(1)
-        print("Apple accepted the SMS code.")
+        valid = api.validate_2fa_code(code)
     except Exception as exc:
         print(
             f"Code validation failed ({type(exc).__name__}).",
@@ -122,11 +99,12 @@ def do_sms_forced(api):
         )
         sys.exit(1)
 
+    if not valid:
+        print("Code validation failed.", file=sys.stderr)
+        sys.exit(1)
     if not api.is_trusted_session:
-        print("Trusting session...")
-        if not api.trust_session():
-            print("Apple accepted the code but did not trust the session.", file=sys.stderr)
-            sys.exit(1)
+        print("Apple accepted the code but did not trust the session.", file=sys.stderr)
+        sys.exit(1)
 
 
 def do_2fa(api):
@@ -156,8 +134,8 @@ def do_2fa(api):
         print("Invalid 2FA code.", file=sys.stderr)
         sys.exit(1)
     if not api.is_trusted_session:
-        print("Trusting session...")
-        api.trust_session()
+        print("Apple accepted the code but did not trust the session.", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -234,6 +212,10 @@ def main():
         print("\nAuthentication incomplete — still requires 2FA.", file=sys.stderr)
         print("If you saw a push popup instead of a numeric code, try:", file=sys.stderr)
         print("  ./icloudctl auth --force-sms", file=sys.stderr)
+        sys.exit(1)
+
+    if not api.is_trusted_session:
+        print("Authentication incomplete — session is not trusted.", file=sys.stderr)
         sys.exit(1)
 
     print("\nAUTH_OK")
