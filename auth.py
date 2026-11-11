@@ -9,10 +9,12 @@ Modes:
   3. --trust-token <value>: inject a browser trust-token extracted from
      icloud.com DevTools → Application → Cookies → X-APPLE-WEBAUTH-HSA-TRUST
   4. --accept-terms: accept Apple's updated iCloud terms of service
+  5. --enable-pcs: request Drive PCS access with device consent
 
 Usage:
   ./icloudctl auth
   ./icloudctl auth --accept-terms
+  ./icloudctl auth --enable-pcs
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml --force-sms
   .venv/bin/python auth.py ~/.config/icloud-linux/config.yaml --trust-token <TOKEN>
@@ -20,12 +22,17 @@ Usage:
 iOS 26 beta workaround:
   If Apple is sending a push popup instead of a numeric code, use --force-sms.
 """
+import atexit
 import os
 import sys
 import yaml
 import requests
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import PyiCloud2FARequiredException
+from saved_session import (
+    Publication, SessionStore, SessionUnavailable, check_dependency, readiness,
+    pcs_guidance, require_readiness, verify_pcs_access,
+)
 
 
 def load_config(path):
@@ -138,6 +145,24 @@ def do_2fa(api):
         sys.exit(1)
 
 
+def ensure_drive_access(api, enable_pcs):
+    state = api._check_pcs_consent()
+    if (
+        isinstance(state, dict)
+        and state.get("isICDRSDisabled") is True
+        and state.get("isDeviceConsentedForPCS") is False
+        and enable_pcs
+    ):
+        reply = api.session.post(
+            f"{api._setup_endpoint}/enableDeviceConsentForPCS", params=api.params
+        ).json()
+        if not isinstance(reply, dict) or reply.get("isDeviceConsentNotificationSent") is not True:
+            raise SessionUnavailable("pcs-notification-failed")
+        input("Approve PCS access on your Apple device, then press Enter: ")
+        state = api._check_pcs_consent()
+    verify_pcs_access(api, "iclouddrive", state, user_action=enable_pcs)
+
+
 def main():
     args = sys.argv[1:]
     config_path = os.path.expanduser(
@@ -152,6 +177,7 @@ def main():
             trust_token = args[idx + 1]
     debug = "--debug" in args
     accept_terms = "--accept-terms" in args
+    enable_pcs = "--enable-pcs" in args
 
     cfg = load_config(config_path)
     username = cfg.get("username")
@@ -174,9 +200,16 @@ def main():
         endpoint = None
         print("Using default endpoint.")
 
+    check_dependency()
+    store = SessionStore(cookie_dir, username)
+    candidate = store.begin(purpose=Publication.INTERACTIVE)
+    atexit.register(candidate.close)
+    if candidate.repair_revision is not None:
+        print("Saved checkpoint is corrupt. Starting fresh interactive authentication. "
+              "The original remains unchanged until a validated replacement is ready.")
     api = PyiCloudService(
         username, password,
-        cookie_directory=cookie_dir,
+        cookie_directory=candidate.directory,
         accept_terms=accept_terms,
         authenticate=False,
     )
@@ -218,6 +251,48 @@ def main():
         print("Authentication incomplete — session is not trusted.", file=sys.stderr)
         sys.exit(1)
 
+    reason = readiness(api, username)
+    if reason:
+        print(f"\nSession not saved: {reason}.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        ensure_drive_access(api, enable_pcs)
+    except SessionUnavailable as exc:
+        reason = exc.args[0]
+        print(
+            f"\nSession not saved: {reason}. {pcs_guidance(reason) or 'Check the reported state before retrying.'}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(
+            f"\nSession not saved: Drive PCS check failed ({type(exc).__name__}). "
+            "Check connectivity and try authentication again.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    reason = readiness(api, username)
+    if reason:
+        print(f"\nSession not saved: {reason}.", file=sys.stderr)
+        sys.exit(1)
+    api.session._save_session_data()
+    api.session.cookies.save()
+    reason = readiness(api, username)
+    if reason:
+        print(f"\nSession not saved: {reason}.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        store.publish(candidate, validate=lambda: require_readiness(api, username))
+    except SessionUnavailable as exc:
+        if exc.args[0] == "publication-indeterminate":
+            print(
+                "\nSession publication-indeterminate. The saved checkpoint may have changed; "
+                "stop session users and inspect the store before retrying.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"\nSession not saved: {exc.args[0]}.", file=sys.stderr)
+        sys.exit(1)
     print("\nAUTH_OK")
     print(f"Session saved to: {cookie_dir}")
 
