@@ -21,11 +21,12 @@ from contextlib import closing, contextmanager, nullcontext
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
+from copy import copy
 
 import fuse
 import yaml
 from fuse import Fuse
-from pyicloud import PyiCloudService
+from saved_session import SavedSession, State, SessionUnavailable, pcs_guidance
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
@@ -47,6 +48,13 @@ DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
 DEFAULT_FILE_MODE = 0o644
 DEFAULT_DIR_MODE = 0o755
+
+
+def complete_on_demand_scan(engine, state_dir):
+    engine.initial_scan()
+    os.makedirs(state_dir, exist_ok=True)
+    with open(os.path.join(state_dir, "sync_done"), "w") as marker:
+        marker.write(str(time.time()))
 
 
 def state_locked(method):
@@ -955,6 +963,8 @@ class ICloudSyncEngine:
         self.remote_refresh_interval_seconds = remote_refresh_interval_seconds
         self.warmup_workers = max(1, int(warmup_workers))
         self.auto_sync = bool(auto_sync)
+        self.metadata_ready = False
+        self.crawl_lock = threading.Lock()
         # An empty sync_paths value preserves unrestricted syncing.
         self.sync_paths = normalize_icloud_paths(sync_paths) or None
         self.exclude_paths = normalize_icloud_paths(exclude_paths)
@@ -992,13 +1002,22 @@ class ICloudSyncEngine:
         if self.has_persistent_cache():
             self.logger.info("Using persistent local cache from %s", self.mirror.root)
             self._reconcile_persistent_cache()
+            self.metadata_ready = True
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
         else:
             self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
-            self.initial_scan()
-            if self.warmup_mode == "background":
-                self._schedule_all_unhydrated()
+            try:
+                self.initial_scan()
+            except Exception as exc:
+                self.logger.error(
+                    "Initial metadata crawl failed (%s); keeping cache mounted and uploads paused. "
+                    "Metadata retry uses the normal refresh interval or an explicit sync request.",
+                    type(exc).__name__,
+                )
+            else:
+                if self.warmup_mode == "background":
+                    self._schedule_all_unhydrated()
         if self.auto_sync:
             self._start_background_threads()
         else:
@@ -1038,9 +1057,17 @@ class ICloudSyncEngine:
         return self.state.count_entries() > 0 and os.path.isdir(self.mirror.root)
 
     def initial_scan(self):
-        crawl_started_at = int(time.time())
-        snapshot = self._crawl_remote_snapshot()
-        self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+        self._scan_and_apply(protect_recent=True)
+        self.metadata_ready = True
+
+    def _scan_and_apply(self, *, protect_recent):
+        with self.crawl_lock:
+            crawl_started_at = int(time.time())
+            snapshot = self._crawl_remote_snapshot()
+            if protect_recent:
+                self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+            else:
+                self._apply_remote_snapshot(snapshot)
 
     def _reconcile_persistent_cache(self):
         entries = self.state.list_entries()
@@ -1192,39 +1219,101 @@ class ICloudSyncEngine:
     def _crawl_remote_snapshot(self):
         self.logger.info("Starting remote metadata crawl")
         snapshot = {}
+        paths = {"/"}
+        file_ids = set()
         queue = deque()
         root = self.api.drive.root
         queue.append((root, "/", root.data.get("shareID")))
         started_at = time.time()
         last_progress_log = started_at
         scanned_folders = 0
-        _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
         FOLDER_TIMEOUT = 60  # seconds per folder before giving up
 
         while queue:
             node, path, inherited_shareid = queue.popleft()
+            node = copy(node)
+            node.data = {key: value for key, value in node.data.items() if key not in ("items", "status")}
+            requested_id = node.data.get("drivewsid")
             if inherited_shareid and not node.data.get("shareID"):
                 node.data = {**node.data, "shareID": inherited_shareid}
             scanned_folders += 1
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
             try:
-                future = _crawl_executor.submit(node.get_children, True)
+                future = executor.submit(node.get_children, True)
                 children = future.result(timeout=FOLDER_TIMEOUT)
             except TimeoutError:
                 self.logger.warning(
-                    "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
+                    "Remote crawl incomplete after folder timeout (%ss)", FOLDER_TIMEOUT
                 )
-                continue
+                raise
             except Exception as exc:
-                self.logger.error("Failed to enumerate %s: %s", path, exc)
-                continue
+                self.logger.error("Remote crawl incomplete (%s)", type(exc).__name__)
+                raise
+            finally:
+                # A timed-out read may finish later, but cannot publish a snapshot.
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            if node.data.get("drivewsid") != requested_id:
+                raise ValueError("Remote folder identity mismatch")
+            if "status" in node.data and node.data["status"] != "OK":
+                raise ValueError("Incomplete remote folder")
+            if "items" in node.data and not isinstance(node.data["items"], list):
+                raise ValueError("Invalid remote folder items")
 
             for child in children:
-                child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
+                data = child.data
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid remote node data")
+                remote_id = data.get("drivewsid")
+                node_type = data.get("type")
+                if isinstance(node_type, str):
+                    node_type = node_type.upper()
+                if remote_id == "TRASH_ROOT" and node_type is None:
+                    child.data = {**data, "type": "TRASH"}
+                    node_type = "TRASH"
+                if (
+                    not isinstance(remote_id, str) or not remote_id.strip()
+                    or remote_id in snapshot or remote_id == root.data.get("drivewsid")
+                    or node_type not in ("FILE", "FOLDER", "APP_LIBRARY", "TRASH")
+                ):
+                    raise ValueError("Invalid or duplicate remote identity")
+                name = child.name
+                if (
+                    not isinstance(name, str) or not name or name in (".", "..")
+                    or "/" in name or "\0" in name
+                ):
+                    raise ValueError("Invalid remote name")
+                child_path = "/" + name if path == "/" else path.rstrip("/") + "/" + name
+                if child_path in paths:
+                    raise ValueError("Duplicate remote path")
+                paths.add(child_path)
+                for field in ("docwsid", "zone"):
+                    value = data.get(field)
+                    if (node_type == "FILE" or value is not None) and (
+                        not isinstance(value, str) or not value.strip()
+                    ):
+                        raise ValueError("Invalid remote document identity")
+                if node_type == "FILE":
+                    size = data.get("size")
+                    if not (
+                        (type(size) is int and 0 <= size <= 2**63 - 1)
+                        or (isinstance(size, str) and size.isascii() and size.isdecimal()
+                            and len(size) <= 19 and int(size) <= 2**63 - 1)
+                    ):
+                        raise ValueError("Invalid remote file size")
                 meta = self._node_to_meta(
                     child,
                     child_path,
                     inherited_shareid=node.data.get("shareID") or inherited_shareid,
                 )
+                if node_type == "FILE":
+                    identity = (
+                        json.dumps(meta["remote_shareid"], sort_keys=True),
+                        meta["remote_zone"], meta["remote_docwsid"],
+                    )
+                    if identity in file_ids:
+                        raise ValueError("Duplicate remote document identity")
+                    file_ids.add(identity)
                 if meta.get("remote_shareid") and not child.data.get("shareID"):
                     child.data = {**child.data, "shareID": meta["remote_shareid"]}
                 snapshot[meta["remote_drivewsid"]] = meta
@@ -1544,12 +1633,10 @@ class ICloudSyncEngine:
     def _run_remote_refresh(self, reason):
         try:
             self._log_sync("refresh-start", reason=reason)
-            crawl_started_at = int(time.time())
-            snapshot = self._crawl_remote_snapshot()
-            self._apply_remote_snapshot(snapshot, crawl_started_at=crawl_started_at)
+            self.initial_scan()
             self._log_sync("refresh-complete", reason=reason)
         except Exception as exc:
-            self.logger.error("Remote refresh failed (%s): %s", reason, exc)
+            self.logger.error("Remote refresh failed (%s): %s", reason, type(exc).__name__)
 
     def _refresh_loop(self):
         immediate = self.has_persistent_cache()
@@ -1564,6 +1651,9 @@ class ICloudSyncEngine:
             self._run_remote_refresh("manual" if manual else "scheduled")
 
     def sync_dirty_entries(self):
+        if not self.metadata_ready:
+            self._log_sync("uploads-paused", reason="initial-metadata-unavailable")
+            return
         dirty_entries = [
             entry for entry in self.state.list_dirty_entries()
             if self._entry_allowed_to_sync(entry)
@@ -1788,8 +1878,7 @@ class ICloudSyncEngine:
         except KeyError:
             if not inherited_shareid:
                 raise
-            snapshot = self._crawl_remote_snapshot()
-            self._apply_remote_snapshot(snapshot)
+            self._scan_and_apply(protect_recent=False)
             path = "/" + child_name if parent_path == "/" else parent_path.rstrip("/") + "/" + child_name
             entry = self.state.get_entry(path)
             if entry and entry.get("remote_drivewsid"):
@@ -2092,7 +2181,6 @@ class ICloudFS(Fuse):
         self.fuse_args.add("default_permissions")
         self.logger = logging.getLogger("icloud")
         self.username = None
-        self.password = None
         self.cache_dir = None
         self.api = None
         self.mirror = None
@@ -2197,87 +2285,37 @@ class ICloudFS(Fuse):
             return
         self.sync_engine.request_remote_refresh()
 
-    def init_icloud(self, username, password, cache_dir, cookie_dir=None, require_session=True):
-        """Initialise iCloud API connection.
-
-        If *require_session* is False (the default when called from the systemd
-        service path), an auth failure sets self.api = None and logs a clear
-        error rather than crashing the process.  The FUSE layer will return
-        EACCES for all operations until a session is restored via
-        './icloudctl auth' followed by './icloudctl restart'.
-        """
+    def init_icloud(self, username, cache_dir, cookie_dir=None, require_session=True):
+        """Resume saved trust once. Interactive login belongs to auth.py."""
         self.username = username
-        self.password = password
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
-        if cookie_dir:
-            os.makedirs(cookie_dir, exist_ok=True)
-
-        try:
-            # Resolve Apple account partition (fixes 421 redirect for non-default shards)
-            import requests as _req
-            _r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={}, timeout=10)
-            _partition = _r.headers.get("x-apple-user-partition")
-
-            self.api = PyiCloudService(username, password,
-                                       cookie_directory=cookie_dir,
-                                       authenticate=False)
-            if _partition:
-                self.api._setup_endpoint = (
-                    f"https://p{_partition}-setup.icloud.com/setup/ws/1"
+        cookie_dir = cookie_dir or os.path.expanduser("~/.config/icloud-linux/cookies")
+        self.saved_session = SavedSession(username, cookie_dir).resume()
+        self.api = self.saved_session.client
+        self.logger.info("Saved session state=%s reason=%s",
+                         self.saved_session.state.value, self.saved_session.reason)
+        if self.saved_session.state is not State.AUTHENTICATED:
+            guidance = pcs_guidance(self.saved_session.reason)
+            if self.saved_session.state is State.INDETERMINATE:
+                guidance = (
+                    "Session publication is indeterminate and the checkpoint may have changed. "
+                    "Stop session users and inspect the store before retrying."
                 )
-            self.api.authenticate()
-            if self.api.requires_2fa:
-                if sys.stdin.isatty():
-                    print("Two-factor authentication required.")
-                    code = input("Enter the verification code: ").strip()
-                    result = self.api.validate_2fa_code(code)
-                    print("Result: %s" % result)
-                    if not result or not self.api.is_trusted_session:
-                        raise RuntimeError("2FA code verification or session trust failed.")
-                else:
-                    raise RuntimeError(
-                        "2FA required, but no interactive terminal is available. "
-                        "Run './icloudctl auth' first to establish a trusted session."
-                    )
-
-            if self.api.requires_2sa:
-                if sys.stdin.isatty():
-                    print("Two-step authentication required.")
-                    devices = self.api.trusted_devices
-                    for index, device in enumerate(devices):
-                        label = device.get("deviceName") or f"SMS to {device.get('phoneNumber', 'unknown')}"
-                        print(f"{index}: {label}")
-                    selected = int(input("Select device index: ").strip() or "0")
-                    device = devices[selected]
-                    self.api.send_verification_code(device)
-                    code = input("Enter the verification code: ").strip()
-                    if not self.api.validate_verification_code(device, code):
-                        raise RuntimeError("Failed to verify 2SA code")
-                else:
-                    raise RuntimeError(
-                        "2SA required, but no interactive terminal is available. "
-                        "Run './icloudctl auth' first to establish a trusted session."
-                    )
-
-            if self.api.requires_2fa or self.api.requires_2sa:
-                raise RuntimeError("Additional authentication still required after code verification.")
-
-        except Exception as exc:
-            self.logger.error("Failed to connect to iCloud: %s", exc)
+            if guidance is None:
+                guidance = (
+                    "Run './icloudctl auth' then './icloudctl restart'."
+                    if self.saved_session.state is State.NEEDS_USER
+                    else "Retry startup later."
+                )
+            elif self.saved_session.reason == "pcs-pending":
+                guidance += " Restart the service when ready."
+            self.logger.error("%s No automatic login is scheduled.", guidance)
             if require_session:
-                raise
-            # Non-fatal path: park in unauthenticated state.  The FUSE layer
-            # will return EACCES for all operations; the service stays up and
-            # won't trigger Apple's lockout by crash-looping.
-            self.logger.error(
-                "Service starting in UNAUTHENTICATED mode.  "
-                "Run './icloudctl auth' then './icloudctl restart' to restore access."
-            )
-            self.api = None
+                raise SessionUnavailable(self.saved_session.reason)
+            self.logger.error("Service starting in UNAUTHENTICATED mode.")
 
     def _is_authenticated(self):
-        """Return True if a live iCloud session is available."""
         return self.api is not None
 
     def _is_directory_type(self, entry_type):
@@ -2816,9 +2854,8 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
         logger.error("Invalid configuration: %s", exc)
         sys.exit(1)
     username = config.get("username")
-    password = config.get("password")
-    if not username or not password:
-        logger.error("Username or password not provided in config file")
+    if not username:
+        logger.error("Username not provided in config file")
         sys.exit(1)
 
     cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/icloud-linux"))
@@ -2864,17 +2901,12 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
                 return
             logger.info("SIGUSR1: starting on-demand remote metadata crawl")
             try:
-                fs.sync_engine.initial_scan()
+                complete_on_demand_scan(
+                    fs.sync_engine, os.path.expanduser("~/.local/state/icloud-linux")
+                )
                 logger.info("SIGUSR1: on-demand remote metadata crawl complete")
             except Exception as exc:
-                logger.error("SIGUSR1: on-demand remote metadata crawl failed: %s", exc)
-            finally:
-                # Write completion marker so icloudctl sync can detect done.
-                state_dir = os.path.expanduser("~/.local/state/icloud-linux")
-                os.makedirs(state_dir, exist_ok=True)
-                marker = os.path.join(state_dir, "sync_done")
-                with open(marker, "w") as fh:
-                    fh.write(str(time.time()))
+                logger.error("SIGUSR1: on-demand remote metadata crawl failed: %s", type(exc).__name__)
 
         threading.Thread(target=_one_shot, name="icloud-on-demand-sync", daemon=True).start()
 
@@ -2883,7 +2915,7 @@ iCloud Linux: Mount iCloud Drive as a FUSE filesystem
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, handle_sigusr1)
 
-    fs.init_icloud(username, password, cache_dir, cookie_dir, require_session=interactive)
+    fs.init_icloud(username, cache_dir, cookie_dir, require_session=interactive)
     fs.init_local_cache(
         cache_dir,
         warmup_mode,

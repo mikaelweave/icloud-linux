@@ -7,11 +7,15 @@ import stat
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from requests.models import RequestEncodingMixin, Response
 
-from driver import IO_CHUNK_SIZE, ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream, SyncState
+from driver import (
+    IO_CHUNK_SIZE, ICloudFS, ICloudSyncEngine, LocalMirror, NamedFileStream,
+    SyncState, complete_on_demand_scan,
+)
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
+from pyicloud.services.drive import DriveNode
 
 
 class NoUnboundedReadStream(io.BytesIO):
@@ -409,6 +413,406 @@ class RemoteSnapshotRaceTests(unittest.TestCase):
         self.assertIsNone(self.state.get_entry("/old.txt"))
         self.assertFalse(self.mirror.exists("/old.txt"))
 
+    def test_failed_root_crawl_preserves_cached_file(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=1)
+        self.engine.api.drive.root.data = {}
+        self.engine.api.drive.root.get_children.side_effect = RuntimeError("offline")
+
+        self.engine._run_remote_refresh("test")
+
+        self.assertIsNotNone(self.state.get_entry("/old.txt"))
+        self.assertTrue(self.mirror.exists("/old.txt"))
+
+    def test_incomplete_folder_response_cannot_reuse_old_items(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=1)
+        connection = Mock()
+        connection.get_node_data.return_value = {"status": "incomplete"}
+        self.engine.api.drive.root = DriveNode(connection, {
+            "drivewsid": "root",
+            "items": [],
+        })
+
+        self.engine._run_remote_refresh("test")
+
+        self.assertIsNotNone(self.state.get_entry("/old.txt"))
+        self.assertTrue(self.mirror.exists("/old.txt"))
+
+    def test_incomplete_or_malformed_real_folder_preserves_cache(self):
+        cases = [
+            {"status": "incomplete", "items": []},
+            {"status": "incomplete", "items": [{"drivewsid": "irrelevant"}]},
+            {"status": None, "items": []},
+            {"status": "NOT_FOUND", "items": []},
+            {"items": {}},
+            {"items": None},
+            {},
+        ]
+        for nested in (False, True):
+            for payload in cases:
+                with self.subTest(nested=nested, payload=payload):
+                    self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                    connection = Mock()
+                    folder = {"drivewsid": "folder", "name": "folder", "type": "FOLDER"}
+                    connection.get_node_data.side_effect = lambda identity, share: (
+                        {"items": [folder]} if nested and identity == "root" else payload
+                    )
+                    self.engine.api.drive.root = DriveNode(connection, {"drivewsid": "root"})
+                    self.engine._run_remote_refresh("test")
+                    self.assertIsNotNone(self.state.get_entry("/old.txt"))
+                    self.assertTrue(self.mirror.exists("/old.txt"))
+
+    def test_complete_real_empty_folder_can_remove_missing_cache(self):
+        for nested in (False, True):
+            folder_id = "folder" if nested else "root"
+            for payload in ({"items": []}, {"status": "OK", "items": []},
+                            {"status": "OK", "drivewsid": folder_id, "items": []}):
+                with self.subTest(nested=nested, payload=payload):
+                    self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                    connection = Mock()
+                    folder = {"drivewsid": "folder", "name": "folder", "type": "FOLDER"}
+                    connection.get_node_data.side_effect = lambda identity, share: (
+                        {"items": [folder]} if nested and identity == "root" else payload
+                    )
+                    self.engine.api.drive.root = DriveNode(connection, {"drivewsid": "root"})
+                    self.engine._run_remote_refresh("test")
+                    self.assertIsNone(self.state.get_entry("/old.txt"))
+                    self.assertFalse(self.mirror.exists("/old.txt"))
+
+    def test_wrong_refreshed_folder_identity_preserves_cache(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                connection = Mock()
+                folder = {"drivewsid": "folder", "name": "folder", "type": "FOLDER"}
+                connection.get_node_data.side_effect = lambda identity, share: (
+                    {"drivewsid": "root", "items": [folder]}
+                    if nested and identity == "root"
+                    else {"status": "OK", "drivewsid": "different", "items": []}
+                )
+                self.engine.api.drive.root = DriveNode(connection, {"drivewsid": "root"})
+                self.engine._run_remote_refresh("test")
+                self.assertIsNotNone(self.state.get_entry("/old.txt"))
+                self.assertEqual(self.mirror.read("/old.txt", 7, 0), b"content")
+
+    def test_invalid_remote_file_size_preserves_existing_bytes(self):
+        missing = object()
+        for nested in (False, True):
+            for size in (missing, None, -1, "-1", "", "bad", True, 1.5, 2**63):
+                with self.subTest(nested=nested, size=size):
+                    self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                    data = {"name": "old.txt", "type": "FILE", "drivewsid": "remote-/old.txt",
+                            "docwsid": "doc", "zone": "zone"}
+                    if size is not missing:
+                        data["size"] = size
+                    folder = {"drivewsid": "folder", "name": "folder", "type": "FOLDER"}
+                    connection = Mock()
+                    connection.get_node_data.side_effect = lambda identity, share: (
+                        {"items": [folder]} if nested and identity == "root" else {"items": [data]}
+                    )
+                    self.engine.api.drive.root = DriveNode(connection, {"drivewsid": "root"})
+                    self.engine._run_remote_refresh("test")
+                    self.assertEqual(self.mirror.read("/old.txt", 7, 0), b"content")
+                    self.assertEqual(self.state.get_entry("/old.txt")["size"], 7)
+
+    def test_valid_zero_size_file_is_applied(self):
+        for size in (0, "0"):
+            with self.subTest(size=size):
+                self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                connection = Mock()
+                connection.get_node_data.return_value = {"items": [{
+                    "name": "old.txt", "type": "FILE", "drivewsid": "remote-/old.txt",
+                    "docwsid": "doc", "zone": "zone", "size": size,
+                }]}
+                self.engine.api.drive.root = DriveNode(connection, {"drivewsid": "root"})
+                self.engine._run_remote_refresh("test")
+                self.assertEqual(self.mirror.read("/old.txt", 7, 0), b"")
+                self.assertEqual(self.state.get_entry("/old.txt")["size"], 0)
+                self.assertTrue(self.state.get_entry("/old.txt")["hydrated"])
+
+    def test_overlapping_refreshes_cannot_publish_older_snapshot_last(self):
+        old_entered = threading.Event()
+        release_old = threading.Event()
+        new_done = threading.Event()
+        meta = {"path": "/new.txt", "parent_path": "/", "type": "file",
+                "remote_drivewsid": "new-id", "size": 0, "mtime": 1}
+
+        def crawl():
+            if threading.current_thread().name == "older-crawl":
+                old_entered.set()
+                if not release_old.wait(5):
+                    raise TimeoutError("test timed out")
+                return {}
+            return {"new-id": meta}
+
+        self.engine._crawl_remote_snapshot = Mock(side_effect=crawl)
+        older = threading.Thread(target=self.engine._run_remote_refresh,
+                                 args=("background",), name="older-crawl")
+
+        def on_demand():
+            try:
+                complete_on_demand_scan(self.engine, os.path.join(self.root, "markers"))
+            finally:
+                new_done.set()
+
+        newer = threading.Thread(target=on_demand, name="newer-crawl")
+        older.start()
+        self.assertTrue(old_entered.wait(5))
+        newer.start()
+        new_done.wait(0.3)
+        release_old.set()
+        older.join(5)
+        newer.join(5)
+        self.assertFalse(older.is_alive())
+        self.assertFalse(newer.is_alive())
+        self.assertIsNotNone(self.state.get_entry("/new.txt"))
+        self.assertTrue(self.mirror.exists("/new.txt"))
+
+    def test_failed_scan_does_not_block_later_scan(self):
+        self.engine._crawl_remote_snapshot = Mock(side_effect=[RuntimeError("offline"), {}])
+        self.engine._run_remote_refresh("failed")
+        done = threading.Event()
+        worker = threading.Thread(target=lambda: (self.engine.initial_scan(), done.set()))
+        worker.start()
+        worker.join(5)
+        self.assertTrue(done.is_set())
+        self.assertFalse(worker.is_alive())
+
+    def test_shared_reconciliation_serializes_with_background_scan(self):
+        old_entered = threading.Event()
+        release_old = threading.Event()
+        reconcile_done = threading.Event()
+        meta = {"path": "/Shared/new.txt", "parent_path": "/Shared", "type": "file",
+                "remote_drivewsid": "new-id", "size": 0, "mtime": 1}
+
+        def crawl():
+            if threading.current_thread().name == "older-crawl":
+                old_entered.set()
+                if not release_old.wait(5):
+                    raise TimeoutError("test timed out")
+                return {}
+            return {"new-id": meta}
+
+        self.engine._crawl_remote_snapshot = Mock(side_effect=crawl)
+        self.engine._shareid_for_path = Mock(return_value={"zone": "shared"})
+        self.engine._refresh_child_meta = Mock(side_effect=KeyError("not found"))
+        older = threading.Thread(target=self.engine._run_remote_refresh,
+                                 args=("background",), name="older-crawl")
+        results = []
+
+        def reconcile():
+            try:
+                results.append(self.engine._reconcile_child_meta("/Shared", "new.txt"))
+            finally:
+                reconcile_done.set()
+
+        newer = threading.Thread(target=reconcile)
+        older.start()
+        self.assertTrue(old_entered.wait(5))
+        newer.start()
+        reconcile_done.wait(0.3)
+        release_old.set()
+        older.join(5)
+        newer.join(5)
+        self.assertFalse(older.is_alive())
+        self.assertFalse(newer.is_alive())
+        self.assertEqual(results[0]["remote_drivewsid"], "new-id")
+        self.assertIsNotNone(self.state.get_entry("/Shared/new.txt"))
+
+    def test_missing_parent_does_not_block_another_file_across_restart(self):
+        for path in ("/a.txt", "/b.txt"):
+            self._add_clean_remote_file(path, last_synced_at=1)
+            self.state.mark_dirty(path)
+        self.engine.metadata_ready = True
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(
+            side_effect=lambda path: None if path == "/a.txt" else parent
+        )
+        self.engine.ensure_local_file = Mock()
+        self.engine._node_from_entry = Mock()
+        self.engine._delete_remote_node = Mock()
+        self.engine._reconcile_child_meta = Mock(return_value={
+            "remote_drivewsid": "remote-/b.txt", "size": 7, "mtime": 123,
+        })
+
+        self.engine.sync_dirty_entries()
+        reopened = SyncState(os.path.join(self.root, "state.sqlite3"))
+        self.addCleanup(reopened.close)
+        engine = ICloudSyncEngine(self.engine.api, self.mirror, reopened, Mock())
+        self.addCleanup(engine.shutdown)
+        engine.metadata_ready = True
+        engine._ensure_remote_parent = self.engine._ensure_remote_parent
+        engine.ensure_local_file = self.engine.ensure_local_file
+        engine._node_from_entry = self.engine._node_from_entry
+        engine._delete_remote_node = self.engine._delete_remote_node
+        engine._reconcile_child_meta = self.engine._reconcile_child_meta
+        engine.sync_dirty_entries()
+
+        parent.upload.assert_called_once()
+        self.assertTrue(reopened.get_entry("/a.txt")["dirty"])
+        self.assertFalse(reopened.get_entry("/b.txt")["dirty"])
+
+    def test_existing_parent_allows_file_upload(self):
+        self._add_clean_remote_file("/b.txt", last_synced_at=1)
+        self.state.mark_dirty("/b.txt")
+        parent = Mock()
+        parent.data = {}
+        self.engine._ensure_remote_parent = Mock(return_value=parent)
+        self.engine.ensure_local_file = Mock()
+        self.engine._node_from_entry = Mock()
+        self.engine._delete_remote_node = Mock()
+        self.engine._reconcile_child_meta = Mock(return_value={
+            "remote_drivewsid": "remote-/b.txt", "size": 7, "mtime": 123,
+        })
+
+        self.engine._sync_file(self.state.get_entry("/b.txt"))
+
+        parent.upload.assert_called_once()
+        self.assertFalse(self.state.get_entry("/b.txt")["dirty"])
+
+    def test_failed_nested_crawl_does_not_apply_partial_snapshot(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=1)
+        child = Mock(name="folder")
+        child.name = "folder"
+        child.data = {"type": "FOLDER", "drivewsid": "folder-1"}
+        child.get_children.side_effect = RuntimeError("offline")
+        root = self.engine.api.drive.root
+        root.data = {}
+        root.get_children.return_value = [child]
+
+        self.engine._run_remote_refresh("test")
+
+        self.assertIsNotNone(self.state.get_entry("/old.txt"))
+        self.assertIsNone(self.state.get_entry("/folder"))
+
+    def test_timed_out_crawl_does_not_apply_snapshot(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=1)
+        self.engine.api.drive.root.data = {}
+        executor = Mock()
+        executor.submit.return_value.result.side_effect = TimeoutError()
+        with patch("driver.ThreadPoolExecutor", return_value=executor):
+            self.engine._run_remote_refresh("test")
+
+        self.assertIsNotNone(self.state.get_entry("/old.txt"))
+        self.assertTrue(self.mirror.exists("/old.txt"))
+
+    def test_incomplete_on_demand_scan_does_not_report_completion(self):
+        self._add_clean_remote_file("/old.txt", last_synced_at=1)
+        self.engine.api.drive.root.data = {}
+        self.engine.api.drive.root.get_children.side_effect = RuntimeError("offline")
+        marker_dir = os.path.join(self.root, "markers")
+        with self.assertRaises(RuntimeError):
+            complete_on_demand_scan(self.engine, marker_dir)
+        self.assertFalse(os.path.exists(os.path.join(marker_dir, "sync_done")))
+        self.assertIsNotNone(self.state.get_entry("/old.txt"))
+
+    def test_complete_on_demand_scan_reports_completion(self):
+        self.engine.api.drive.root.data = {}
+        self.engine.api.drive.root.get_children.return_value = []
+        marker_dir = os.path.join(self.root, "markers")
+        complete_on_demand_scan(self.engine, marker_dir)
+        with open(os.path.join(marker_dir, "sync_done")) as marker:
+            self.assertGreater(float(marker.read()), 0)
+
+    def test_malformed_child_identity_preserves_entire_cached_snapshot(self):
+        valid = {
+            "name": "new.txt", "type": "FILE", "drivewsid": "new-id",
+            "docwsid": "new-doc", "zone": "zone-1", "size": 0,
+        }
+        cases = [
+            dict(valid, drivewsid=None), dict(valid, drivewsid=""),
+            dict(valid, docwsid=None), dict(valid, zone=None),
+            dict(valid, type=None), dict(valid, name="../escape"),
+            dict(valid, name="."), dict(valid, name=""),
+        ]
+        # A missing raw name has a documented drivewsid fallback. An empty
+        # drivewsid is never a usable fallback or a remote identity.
+        cases[-1]["drivewsid"] = None
+        for data in cases:
+            with self.subTest(data=data):
+                self.state.remove_subtree("/new.txt")
+                self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                root = self.engine.api.drive.root
+                root.data = {"drivewsid": "root"}
+                root.get_children.return_value = [DriveNode(Mock(), data)]
+                self.engine._run_remote_refresh("test")
+                self.assertIsNotNone(self.state.get_entry("/old.txt"))
+                self.assertTrue(self.mirror.exists("/old.txt"))
+                self.assertIsNone(self.state.get_entry("/new.txt"))
+
+    def test_duplicate_remote_paths_and_file_identities_abort_whole_snapshot(self):
+        first = {
+            "name": "new.txt", "type": "FILE", "drivewsid": "new-id",
+            "docwsid": "new-doc", "zone": "zone-1", "size": 0,
+        }
+        duplicates = [
+            dict(first, name="other.txt"),
+            dict(first, drivewsid="other-id", docwsid="other-doc"),
+            dict(first, name="other.txt", drivewsid="other-id"),
+        ]
+        for second in duplicates:
+            with self.subTest(second=second):
+                self.state.remove_subtree("/new.txt")
+                self.state.remove_subtree("/other.txt")
+                self._add_clean_remote_file("/old.txt", last_synced_at=1)
+                root = self.engine.api.drive.root
+                root.data = {"drivewsid": "root"}
+                root.get_children.return_value = [DriveNode(Mock(), first), DriveNode(Mock(), second)]
+                self.engine._run_remote_refresh("test")
+                self.assertIsNotNone(self.state.get_entry("/old.txt"))
+                self.assertIsNone(self.state.get_entry("/new.txt"))
+
+    def test_known_special_nodes_and_shared_namespaces_remain_valid(self):
+        nodes = [
+            {"drivewsid": "TRASH_ROOT"},
+            {"drivewsid": "app-1", "type": "APP_LIBRARY", "docwsid": "documents"},
+            {"drivewsid": "app-2", "type": "APP_LIBRARY", "docwsid": "documents"},
+            {"name": "shared-a", "drivewsid": "file-a", "type": "FILE",
+             "docwsid": "same-doc", "zone": "zone", "size": 0, "shareID": {"zone": "share-a"}},
+            {"name": "shared-b", "drivewsid": "file-b", "type": "FILE",
+             "docwsid": "same-doc", "zone": "zone", "size": 0, "shareID": {"zone": "share-b"}},
+        ]
+        children = [DriveNode(Mock(), data) for data in nodes]
+        for child in children[1:3]:
+            child.get_children = Mock(return_value=[])
+        root = self.engine.api.drive.root
+        root.data = {"drivewsid": "root"}
+        root.get_children.return_value = children
+        snapshot = self.engine._crawl_remote_snapshot()
+        self.assertEqual(set(snapshot), {data["drivewsid"] for data in nodes})
+
+    def test_initial_scan_failure_keeps_mount_and_allows_later_metadata_retry(self):
+        for auto_sync in (True, False):
+            with self.subTest(auto_sync=auto_sync):
+                fs = ICloudFS()
+                fs.api = self.engine.api
+                fs.logger = Mock()
+                root = fs.api.drive.root
+                root.data = {"drivewsid": "root"}
+                root.get_children.reset_mock()
+                root.get_children.side_effect = RuntimeError("secret-failure-payload")
+                cache = os.path.join(self.root, f"startup-{auto_sync}")
+                try:
+                    with patch.object(ICloudSyncEngine, "_start_background_threads") as workers:
+                        fs.init_local_cache(cache, "lazy", "copy", 30, 300, 1, auto_sync=auto_sync)
+                    self.assertEqual(workers.call_count, int(auto_sync))
+                    self.assertFalse(fs.sync_engine.stop_event.is_set())
+                    self.assertFalse(fs.sync_engine.metadata_ready)
+                    self.assertEqual(fs.state.count_entries(), 0)
+                    self.assertEqual(len(list(fs.readdir("/", 0))), 2)
+                    self.assertIn("RuntimeError", str(fs.logger.error.call_args))
+                    self.assertNotIn("secret-failure-payload", str(fs.logger.mock_calls))
+                    with patch.object(fs.state, "list_dirty_entries") as pending:
+                        fs.sync_engine.sync_dirty_entries()
+                        pending.assert_not_called()
+                    root.get_children.side_effect = None
+                    root.get_children.return_value = []
+                    fs.sync_engine._run_remote_refresh("scheduled" if auto_sync else "manual")
+                    self.assertTrue(fs.sync_engine.metadata_ready)
+                    self.assertEqual(root.get_children.call_count, 2)
+                finally:
+                    fs.shutdown()
+
 
 class PermissionCallbackTests(unittest.TestCase):
     def setUp(self):
@@ -641,6 +1045,7 @@ class SyncEngineStartupTests(unittest.TestCase):
         }
         obsidian.get_children.return_value = [note]
         root = Mock()
+        root.data = {}
         root.get_children.return_value = [obsidian]
         self.engine.api.drive.root = root
 
@@ -1267,6 +1672,7 @@ class ICloudFSPathPolicyTests(unittest.TestCase):
         self.assertFalse(self.mirror.exists("/outside/destination.txt"))
 
     def test_uploader_skips_disallowed_dirty_entries(self):
+        self.engine.metadata_ready = True
         self._add_entry("/allowed/file.txt")
         self._add_entry("/allowed/excluded/file.txt")
         self._add_entry("/outside/file.txt")

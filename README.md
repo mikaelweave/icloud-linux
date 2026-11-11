@@ -106,12 +106,120 @@ So this project uses:
 - `./icloudctl auth` for the interactive one-time Apple login and 2FA flow
 - a generated user service that reuses the saved session cookies in the background
 
-If Apple expires your session, run:
+At startup, the daemon validates an unexpired saved web-auth cookie. If the
+cookie is missing or Apple rejects it, the daemon attempts one saved-token
+exchange. The daemon does not use a password, request MFA, grant trust, accept
+terms, or request device consent. Apple may still send a notification or reject
+the saved token. `hydrate_dir.py` uses the same resume-only path.
+
+The startup log reports `authenticated`, `needs-user`, `retry-later`, or
+`publication-indeterminate`. `authenticated` means Apple reported a trusted
+session and the required Drive metadata, PCS access, and upload cookie were
+present at the last readiness check before publication. A cookie can expire
+after that check, including before startup returns. `authenticated` does not
+guarantee that later requests will succeed. `retry-later` includes transport errors,
+throttling, server errors, storage conflicts, and `pcs-pending`. Retry startup
+later. The daemon does not schedule a login retry.
+
+For `needs-user`, check the reason in the startup log. If Apple explicitly
+requires device consent, run:
+
+```bash
+./icloudctl auth --enable-pcs
+./icloudctl restart
+```
+
+For other authentication or verification requirements, run:
 
 ```bash
 ./icloudctl auth
 ./icloudctl restart
 ```
+
+For `pcs-state-ambiguous` or `pcs-response-ambiguous`, the adapter cannot
+determine access from Apple's response. Check your account's iCloud web access
+settings and contact Apple Support if the response remains incomplete. Repeated
+consent requests cannot resolve a missing consent field.
+
+For `pcs-pending`, complete any Apple device request and wait for the cookies
+to become available. Restart the daemon later. If an interactive authentication
+attempt reports this state, it does not save the candidate; wait before retrying
+authentication. The daemon never sends a device-consent notification. When
+Apple already reports device consent, the daemon makes one PCS request without
+claiming a user action. Apple may request that a device upload cookies in
+response.
+
+When `--enable-pcs` sends a request, approve it on your Apple device, then
+press Enter. The command checks Apple's consent state and PCS response and
+rechecks session readiness before saving.
+
+There is no automatic runtime session recovery or reload. If a session fails
+after startup, the client is not replaced. Runtime cookie changes remain in the
+client's private working directory and are not continuously checkpointed.
+Existing hydrated cache reads remain available when startup cannot resume.
+
+The adapter requires `pyicloud==2026.10.1`. It honors cookie expiry and Apple's
+reported trust. An HTTP 421 with a numeric partition hint permits one retry
+against the corresponding Apple setup host. Requests have connect and read
+timeouts and no automatic transport retries. GET and HEAD requests can follow
+HTTP redirects. Other methods do not follow redirects automatically.
+
+### Saved session storage
+
+Before upgrading, stop old-version processes that use the same cookie
+directory, including authentication and standalone hydration commands. Old
+versions do not honor the new session store or its process lock.
+
+The store lives under `<cookie_dir>/.saved-sessions/<account-hash>/`. Each
+client writes a private working copy. New directories use mode `0700` and
+secret files use mode `0600`. The first attempt reads the legacy account
+`.session` and `.cookiejar` files without changing them. After Apple accepts
+the candidate, one atomic `accepted.json` bundle holds the pair. A lock and
+generation check prevent stale candidates from replacing a newer interactive
+session when all writers use the lock. The store checks readiness immediately
+before replacing the bundle and synchronizes the directory after replacement.
+If publication fails after replacement, the store attempts to restore the
+previous bundle while holding the lock. If it cannot confirm restoration is
+durable, it reports `publication-indeterminate`. The old bundle may no longer
+be present. Stop all session users and inspect the private store before
+retrying; its files contain credentials.
+
+A process crash or power loss during publication or rollback leaves the
+checkpoint outcome dependent on the filesystem and storage guarantees. The
+process cannot report an indeterminate outcome after it crashes. The lock does
+not protect against old versions or other writers that ignore it.
+
+Once a bundle exists, the legacy files are not imported again. Interactive
+authentication also uses a private candidate and publishes only after the
+trust and Drive checks pass. A corrupt bundle requires explicit authentication.
+The old bundle is retained until a validated replacement is published.
+An abrupt exit or cleanup failure can leave `work-*`, `pending-*`, or
+`rollback-*` entries containing credentials. Remove them only after all
+processes using the store have stopped.
+
+An incomplete or malformed metadata crawl is discarded rather than applied as
+remote deletions. A failed on-demand crawl does not write `sync_done`. The
+marker does not distinguish concurrent sync requests.
+
+This change does not add runtime authentication recovery or uncertain-write
+reconciliation. The sync engine's write and retry logic is unchanged from the
+merged version. The redirect policy above is the exception. A failed or
+interrupted remote mutation may have succeeded on Apple even when the client
+did not receive confirmation. Existing retries are not proof that repeating
+such a mutation is safe.
+
+### Offline verification
+
+Run the suite with an interpreter that already has the pinned dependencies:
+
+```bash
+python -B offline_tests.py
+```
+
+The runner creates a synthetic home and temporary directory in the checkout
+and blocks socket connections and DNS. Authentication tests use synthetic
+sessions and mocked responses through the installed pyicloud implementation.
+They do not contact Apple or use your account configuration.
 
 Existing installations can update the Python dependencies without recreating
 their configuration or service:

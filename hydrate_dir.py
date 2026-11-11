@@ -9,8 +9,8 @@ Usage:
 """
 
 import hashlib, logging, os, sqlite3, sys, tempfile, shutil, time
-import yaml, requests as _req
-from pyicloud import PyiCloudService
+import yaml
+from saved_session import SavedSession, State, SessionUnavailable, pcs_guidance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +27,6 @@ MIRROR_ROOT = os.path.join(CACHE_DIR, "mirror")
 DB_PATH     = os.path.join(CACHE_DIR, "state.sqlite3")
 COOKIE_DIR  = os.path.expanduser(config.get("cookie_dir", "~/.config/icloud-linux/cookies"))
 USERNAME    = config["username"]
-PASSWORD    = config["password"]
 
 TARGET = sys.argv[1] if len(sys.argv) > 1 else "/Downloads/Move2"
 if not TARGET.startswith("/"):
@@ -36,16 +35,13 @@ if not TARGET.startswith("/"):
 log.info("Target: %s", TARGET)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-log.info("Authenticating as %s ...", USERNAME)
-_r = _req.post("https://setup.icloud.com/setup/ws/1/validate", json={})
-_partition = _r.headers.get("x-apple-user-partition")
-api = PyiCloudService(USERNAME, PASSWORD,
-                      cookie_directory=COOKIE_DIR, authenticate=False)
-if _partition:
-    api._setup_endpoint = f"https://p{_partition}-setup.icloud.com/setup/ws/1"
-api.authenticate()
-if api.requires_2fa or api.requires_2sa:
-    raise RuntimeError("2FA required - run ./icloudctl auth first")
+session = SavedSession(USERNAME, COOKIE_DIR).resume()
+if session.state is not State.AUTHENTICATED:
+    guidance = pcs_guidance(session.reason)
+    if session.state is State.INDETERMINATE:
+        guidance = "Checkpoint may have changed; stop session users and inspect the store before retrying."
+    raise SessionUnavailable(f"{session.state.value}: {session.reason}. {guidance or ''}")
+api = session.client
 log.info("Auth OK")
 
 # ── Load unhydrated rows ──────────────────────────────────────────────────────
